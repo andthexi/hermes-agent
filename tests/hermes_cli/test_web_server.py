@@ -1035,6 +1035,95 @@ class TestWebServerEndpoints:
 
 
 
+    def test_session_tree_children_classify_and_return_direct_rows(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="tree-root", source="cli")
+            db.create_session(
+                session_id="tree-branch",
+                source="desktop",
+                parent_session_id="tree-root",
+                model_config={"_branched_from": "tree-root"},
+            )
+            db.create_session(
+                session_id="tree-subagent",
+                source="tool",
+                parent_session_id="tree-root",
+                model_config={"_delegate_from": "tree-root"},
+            )
+            db.create_session(
+                session_id="tree-compression",
+                source="desktop",
+                parent_session_id="tree-root",
+            )
+            db.create_session(
+                session_id="tree-other",
+                source="desktop",
+                parent_session_id="tree-root",
+            )
+            db._conn.execute(
+                "UPDATE sessions SET end_reason='compression', ended_at=? "
+                "WHERE id='tree-root'",
+                (time.time(),),
+            )
+            db._conn.commit()
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/tree-root/children")
+        assert resp.status_code == 200
+        children = {row["id"]: row for row in resp.json()["children"]}
+        assert set(children) == {
+            "tree-branch",
+            "tree-subagent",
+            "tree-compression",
+            "tree-other",
+        }
+        assert children["tree-branch"]["kind"] == "branch"
+        assert children["tree-subagent"]["kind"] == "subagent"
+        assert children["tree-compression"]["kind"] == "compression"
+        assert children["tree-other"]["kind"] == "compression"
+
+        listed = self.client.get("/api/sessions?tree=true&limit=100").json()
+        ids = {row["id"] for row in listed["sessions"]}
+        assert "tree-root" in ids
+        assert not ids.intersection(children)
+
+    def test_session_messages_exact_does_not_follow_compression_child(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="exact-parent", source="cli")
+            db.create_session(
+                session_id="exact-child",
+                source="cli",
+                parent_session_id="exact-parent",
+            )
+            db.append_message("exact-parent", "user", "parent transcript")
+            db.append_message("exact-child", "user", "child transcript")
+            db._conn.execute(
+                "UPDATE sessions SET end_reason='compression', ended_at=? "
+                "WHERE id='exact-parent'",
+                (time.time(),),
+            )
+            db._conn.commit()
+        finally:
+            db.close()
+
+        exact = self.client.get(
+            "/api/sessions/exact-parent/messages?exact=true&limit=500&order=latest"
+        )
+        assert exact.status_code == 200
+        assert exact.json()["session_id"] == "exact-parent"
+        assert exact.json()["messages"][0]["content"] == "parent transcript"
+
+        resolved = self.client.get("/api/sessions/exact-parent/messages")
+        assert resolved.status_code == 200
+        assert resolved.json()["session_id"] == "exact-child"
+
     def test_latest_descendant_survives_parent_cycle(self):
         """Regression for the #39140 CTE salvage: a corrupted parent chain
         that loops (a -> b -> a) must terminate (UNION dedup) instead of
@@ -3901,6 +3990,30 @@ class TestPtyWebSocket:
         assert sub_a2.sent == [frame]
         # A subscriber on a different channel got nothing.
         assert sub_other.sent == []
+
+
+def test_resolve_chat_argv_preserves_explicit_resume_id(monkeypatch):
+    import hermes_cli.main as cli_main
+    import hermes_cli.web_server as ws
+
+    monkeypatch.setattr(
+        cli_main,
+        "_make_tui_argv",
+        lambda *_args, **_kwargs: (["node", "fake-tui.js"], Path("/tmp")),
+    )
+    monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.1", raising=False)
+    monkeypatch.setattr(ws.app.state, "bound_port", 9119, raising=False)
+    monkeypatch.setattr(
+        ws,
+        "_session_latest_descendant",
+        lambda *_args, **_kwargs: pytest.fail("explicit Dashboard resume must not resolve a descendant"),
+    )
+
+    _argv, _cwd, env = ws._resolve_chat_argv(resume="selected-child-id")
+
+    assert env is not None
+    assert env["HERMES_TUI_RESUME"] == "selected-child-id"
+    assert env["HERMES_TUI_EXACT_RESUME"] == "1"
 
 
 def test_resolve_chat_argv_injects_gateway_ws_url(monkeypatch):

@@ -19,7 +19,6 @@
  */
 
 import { Button } from "@nous-research/ui/ui/components/button";
-import { ListItem } from "@nous-research/ui/ui/components/list-item";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { AlertCircle, MessageSquarePlus, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -27,6 +26,7 @@ import { useSearchParams } from "react-router";
 
 import { useI18n } from "@/i18n";
 import { api, type SessionInfo } from "@/lib/api";
+import { SessionTree, SessionTreeToggle, type SessionTreeNodeProps } from "@/components/SessionTree";
 import { cn, timeAgo } from "@/lib/utils";
 
 const SESSION_LIMIT = 30;
@@ -85,7 +85,11 @@ export function ChatSessionList({
     setLoading(true);
     setError(null);
     api
-      .getSessions(SESSION_LIMIT, 0, scopeKey, "recent")
+      .getSessions(SESSION_LIMIT, 0, {
+        profile: scopeKey,
+        order: "recent",
+        tree: true,
+      })
       .then((res) => {
         if (reqRef.current !== myReq) return;
         setSessions(res.sessions);
@@ -177,47 +181,65 @@ export function ChatSessionList({
         </div>
       );
     }
-    return (
-      <div className="flex flex-col gap-0.5">
-        {sessions.map((s) => {
-          const isActive = s.id === activeSessionId;
-          return (
-            <ListItem
-              key={s.id}
-              onClick={() => pick(s.id)}
-              aria-current={isActive ? "true" : undefined}
-              className={cn(
-                "flex-col items-start gap-0.5 rounded px-2 py-1.5",
-                "normal-case tracking-normal",
-                isActive
-                  ? "bg-primary/10 text-foreground border-l-2 border-primary"
-                  : "text-text-secondary hover:bg-midground/5 hover:text-foreground",
-              )}
-            >
-              <span className="w-full truncate text-sm font-medium">
-                {rowLabel(s, t.sessions.untitledSession)}
-              </span>
-              <span className="flex w-full items-center gap-1.5 text-[0.6875rem] text-text-tertiary">
-                <span>{timeAgo(s.last_active)}</span>
-                {s.message_count > 0 && (
-                  <>
-                    <span aria-hidden>·</span>
-                    <span>{s.message_count} msgs</span>
-                  </>
-                )}
-                {s.source && s.source !== "cli" && (
-                  <>
-                    <span aria-hidden>·</span>
-                    <span className="truncate">{s.source}</span>
-                  </>
-                )}
-              </span>
-            </ListItem>
-          );
-        })}
-      </div>
-    );
-  }, [activeSessionId, error, loading, pick, reload, sessions, t]);
+    const renderNode = ({
+      session: s,
+      hasChildren,
+      expanded,
+      onToggleChildren,
+    }: SessionTreeNodeProps) => {
+      const isActive = s.id === activeSessionId;
+      return (
+        <div
+          key={s.id}
+          role="button"
+          tabIndex={0}
+          onClick={() => pick(s.id)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              pick(s.id);
+            }
+          }}
+          aria-current={isActive ? "true" : undefined}
+          className={cn(
+            "flex cursor-pointer flex-col items-start gap-0.5 rounded px-2 py-1.5",
+            "normal-case tracking-normal focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary",
+            isActive
+              ? "bg-primary/10 text-foreground border-l-2 border-primary"
+              : "text-text-secondary hover:bg-midground/5 hover:text-foreground",
+          )}
+        >
+          <div className="flex w-full min-w-0 items-center gap-1">
+            <SessionTreeToggle
+              hasChildren={hasChildren}
+              expanded={expanded}
+              onClick={onToggleChildren}
+              label={`${expanded ? "Collapse" : "Expand"} child sessions`}
+            />
+            <span className="min-w-0 flex-1 truncate text-sm font-medium">
+              {rowLabel(s, t.sessions.untitledSession)}
+            </span>
+          </div>
+          <span className="flex w-full items-center gap-1.5 pl-7 text-[0.6875rem] text-text-tertiary">
+            <span>{timeAgo(s.last_active)}</span>
+            {s.message_count > 0 && (
+              <>
+                <span aria-hidden>·</span>
+                <span>{s.message_count} msgs</span>
+              </>
+            )}
+            {s.source && s.source !== "cli" && (
+              <>
+                <span aria-hidden>·</span>
+                <span className="truncate">{s.source}</span>
+              </>
+            )}
+          </span>
+        </div>
+      );
+    };
+    return <SessionTree roots={sessions} profile={scopeKey} renderNode={renderNode} />;
+  }, [activeSessionId, error, loading, pick, reload, scopeKey, sessions, t]);
 
   return (
     <aside

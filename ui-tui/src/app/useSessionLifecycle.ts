@@ -5,6 +5,7 @@ import { evictInkCaches } from '@hermes/ink'
 import { type RefObject, useCallback, useEffect, useMemo, useRef } from 'react'
 
 import { buildSetupRequiredSections, SETUP_REQUIRED_TITLE } from '../content/setup.js'
+import { STARTUP_EXACT_RESUME } from '../config/env.js'
 import { introMsg, toTranscriptMessages } from '../domain/messages.js'
 import { ZERO } from '../domain/usage.js'
 import { type GatewayClient } from '../gatewayClient.js'
@@ -366,7 +367,11 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
         const previousSid = getUiState().sid
 
-        gw.request<SessionResumeResponse>('session.resume', { cols: colsRef.current, session_id: id })
+        gw.request<SessionResumeResponse>('session.resume', {
+          cols: colsRef.current,
+          session_id: id,
+          exact: STARTUP_EXACT_RESUME
+        })
           .then(raw => {
             const r = asRpcResult<SessionResumeResponse>(raw)
 

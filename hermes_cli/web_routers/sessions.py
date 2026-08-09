@@ -65,6 +65,7 @@ def get_sessions(
     exclude_sources: str = None,
     cwd_prefix: str = None,
     full: bool = False,
+    tree: bool = False,
     profile: Optional[str] = None,
 ):
     """List sessions.
@@ -123,6 +124,8 @@ def get_sessions(
                 include_archived=include_archived,
                 archived_only=archived_only,
                 order_by_last_active=order == "recent",
+                top_level_only=tree,
+                project_compression_tips=not tree,
                 # SQL-level projection: when the caller didn't ask for full
                 # rows, skip the system_prompt blob inside SQLite too (pairs
                 # with the API-level _strip_session_list_rows below).
@@ -137,7 +140,8 @@ def get_sessions(
                 min_message_count=min_message_count,
                 include_archived=include_archived,
                 archived_only=archived_only,
-                exclude_children=True,
+                exclude_children=not tree,
+                top_level_only=tree,
             )
             now = time.time()
             # Same ownership contract as get_session_detail: rows are stamped
@@ -154,6 +158,10 @@ def get_sessions(
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
                 s["archived"] = bool(s.get("archived"))
                 s["pinned"] = bool(s.get("pinned"))
+                if tree:
+                    s["kind"] = "root"
+                    s["child_count"] = int(s.get("child_count") or 0)
+                    s["has_children"] = s["child_count"] > 0
             if not full:
                 _strip_session_list_rows(sessions)
             return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
@@ -529,27 +537,69 @@ async def get_session_stats(profile: Optional[str] = None):
     """
     db = _open_session_db_for_profile(profile, read_only=True)
     try:
-        total = db.session_count(include_archived=True)
-        active_store = db.session_count(include_archived=False)
-        archived = db.session_count(archived_only=True)
+        # The Sessions page presents a root tree. Keep the headline count in
+        # that same projection while retaining raw counts for diagnostics.
+        total = db.session_count(include_archived=True, top_level_only=True)
+        active_store = db.session_count(include_archived=False, top_level_only=True)
+        stored_total = db.session_count(include_archived=True)
+        stored_active = db.session_count(include_archived=False)
+        archived = db.session_count(archived_only=True, top_level_only=True)
         messages = db.message_count()
         by_source: Dict[str, int] = {}
         try:
             by_source = db.session_count_by_source(
                 include_archived=True,
-                exclude_children=True,
+                top_level_only=True,
             )
         except Exception:
             pass
         return {
             "total": total,
             "active_store": active_store,
+            "stored_total": stored_total,
+            "stored_active": stored_active,
             "archived": archived,
             "messages": messages,
             "by_source": by_source,
         }
     finally:
         db.close()
+
+
+@manage_router.get("/api/sessions/{session_id}/children")
+async def get_session_children(session_id: str, profile: Optional[str] = None):
+    def _lookup():
+        db = _open_session_db_for_profile(profile, read_only=True)
+        try:
+            sid = db.resolve_session_id(session_id)
+            if not sid or not db.get_session(sid):
+                return None
+            return sid, db.list_session_children(sid)
+        finally:
+            db.close()
+
+    result = await asyncio.to_thread(_lookup)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    sid, children = result
+    now = time.time()
+    row_profile = _cron_profile_home(profile)[0] if profile else _cron_default_profile()
+    for child in children:
+        child["is_active"] = (
+            child.get("ended_at") is None
+            and (now - child.get("last_active", child.get("started_at", 0))) < 300
+        )
+        child["archived"] = bool(child.get("archived"))
+        child["pinned"] = bool(child.get("pinned"))
+        child["child_count"] = int(child.get("child_count") or 0)
+        child["has_children"] = child["child_count"] > 0
+        child["profile"] = row_profile
+        child["is_default_profile"] = row_profile == "default"
+        # Never expose the raw model/system prompt blobs from this metadata API.
+        child.pop("model_config", None)
+        child.pop("system_prompt", None)
+        child.pop("system_prompt_hash", None)
+    return {"parent_session_id": sid, "children": children}
 
 
 @manage_router.get("/api/sessions/{session_id}")
@@ -605,6 +655,7 @@ async def get_session_messages(
     limit: Optional[int] = Query(None, ge=0),
     offset: int = Query(0, ge=0),
     order: Optional[str] = Query(None),
+    exact: bool = False,
 ):
     if order not in (None, "oldest", "latest"):
         raise HTTPException(
@@ -618,7 +669,8 @@ async def get_session_messages(
             sid = db.resolve_session_id(session_id)
             if not sid:
                 return None
-            sid = db.resolve_resume_session_id(sid)
+            if not exact:
+                sid = db.resolve_resume_session_id(sid)
             # Always page this endpoint. An omitted limit used to load an
             # entire transcript, which can be hundreds of thousands of rows
             # for a runaway session and exhaust the dashboard process. Keep

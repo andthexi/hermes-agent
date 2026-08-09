@@ -32,7 +32,7 @@ import {
   Check,
   Archive,
 } from "lucide-react";
-import { api } from "@/lib/api";
+import { api, getManagementProfile } from "@/lib/api";
 import { shouldRefreshSessions } from "@/lib/session-refresh";
 import {
   importSummary,
@@ -73,6 +73,11 @@ import { useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
+import {
+  SessionTree,
+  SessionTreeToggle,
+  type SessionTreeNodeProps,
+} from "@/components/SessionTree";
 
 const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
   {
@@ -473,6 +478,9 @@ function SessionRow({
   onRename,
   onExport,
   resumeInChatEnabled,
+  hasChildren,
+  childrenExpanded,
+  onToggleChildren,
 }: SessionRowProps) {
   const [messages, setMessages] = useState<SessionMessage[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -486,7 +494,7 @@ function SessionRow({
     if (!isExpanded || messages !== null) return;
     let cancelled = false;
     api
-      .getSessionMessages(session.id)
+      .getSessionMessages(session.id, getManagementProfile(), { exact: true })
       .then((resp) => {
         if (!cancelled) setMessages(resp.messages);
       })
@@ -622,6 +630,14 @@ function SessionRow({
         className="flex cursor-pointer items-start gap-3 p-3 transition-colors hover:bg-secondary/30"
         onClick={onToggle}
       >
+        <span className="flex shrink-0 items-center pt-0.5">
+          <SessionTreeToggle
+            hasChildren={hasChildren}
+            expanded={childrenExpanded}
+            onClick={onToggleChildren}
+            label={`${childrenExpanded ? "Collapse" : "Expand"} child sessions`}
+          />
+        </span>
         <span className="flex shrink-0 items-center pt-0.5">
           <Checkbox
             checked={isSelected}
@@ -1048,7 +1064,10 @@ export default function SessionsPage() {
     if (!silent) sessionsRequestRef.current = requestId;
     if (!silent) setLoading(true);
     api
-      .getSessions(PAGE_SIZE, p * PAGE_SIZE, sessionQueryOptions)
+      .getSessions(PAGE_SIZE, p * PAGE_SIZE, {
+        ...sessionQueryOptions,
+        tree: true,
+      })
       .then((resp) => {
         if (requestId !== sessionsRequestRef.current) return;
         setSessions(resp.sessions);
@@ -1137,7 +1156,10 @@ export default function SessionsPage() {
         })
         .catch(() => {});
       api
-        .getSessions(50, 0, sessionQueryOptions)
+        .getSessions(50, 0, {
+          ...sessionQueryOptions,
+          tree: true,
+        })
         .then((r) => {
           if (cancelled) return;
           setOverviewSessions(r.sessions);
@@ -1277,9 +1299,12 @@ export default function SessionsPage() {
     onDelete: useCallback(
       async (id: string) => {
         try {
+          const wasVisibleRoot = sessions.some((s) => s.id === id);
           await api.deleteSession(id);
-          setSessions((prev) => prev.filter((s) => s.id !== id));
-          setTotal((prev) => prev - 1);
+          if (wasVisibleRoot) {
+            setSessions((prev) => prev.filter((s) => s.id !== id));
+            setTotal((prev) => Math.max(0, prev - 1));
+          }
           if (expandedId === id) setExpandedId(null);
           // Drop the deleted ID from any active bulk-select set — it
           // can't bulk-delete a row that's already gone.
@@ -1303,6 +1328,7 @@ export default function SessionsPage() {
       [
         expandedId,
         refreshEmptyCount,
+        sessions,
         showToast,
         loadStats,
         t.sessions.sessionDeleted,
@@ -2072,28 +2098,52 @@ export default function SessionsPage() {
           </div>
         ) : (
           <>
-            <div className="flex min-w-0 flex-col gap-1.5">
-              {filtered.map((s, index) => (
-                <SessionRow
-                  key={s.id}
-                  session={s}
-                  snippet={snippetMap.get(s.id)}
-                  searchQuery={search || undefined}
-                  isExpanded={expandedId === s.id}
-                  isSelected={selectedIds.has(s.id)}
-                  onToggle={() =>
-                    setExpandedId((prev) => (prev === s.id ? null : s.id))
-                  }
-                  onSelectClick={(event) =>
-                    handleSelectClick(event, index, filtered)
-                  }
-                  onDelete={() => sessionDelete.requestDelete(s.id)}
-                  onRename={handleRename}
-                  onExport={handleExport}
-                  resumeInChatEnabled={resumeInChatEnabled}
-                />
-              ))}
-            </div>
+            <SessionTree
+              roots={filtered}
+              profile={getManagementProfile()}
+              renderNode={({
+                session: s,
+                hasChildren,
+                expanded,
+                onToggleChildren,
+              }: SessionTreeNodeProps) => {
+                const rootIndex = filtered.findIndex((row) => row.id === s.id);
+                return (
+                  <SessionRow
+                    key={s.id}
+                    session={s}
+                    snippet={snippetMap.get(s.id)}
+                    searchQuery={search || undefined}
+                    isExpanded={expandedId === s.id}
+                    isSelected={selectedIds.has(s.id)}
+                    onToggle={() =>
+                      setExpandedId((prev) => (prev === s.id ? null : s.id))
+                    }
+                    onSelectClick={(event) => {
+                      if (rootIndex >= 0) {
+                        handleSelectClick(event, rootIndex, filtered);
+                        return;
+                      }
+                      event.stopPropagation();
+                      setSelectedIds((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(s.id)) next.delete(s.id);
+                        else next.add(s.id);
+                        return next;
+                      });
+                      lastClickedIndexRef.current = null;
+                    }}
+                    onDelete={() => sessionDelete.requestDelete(s.id)}
+                    onRename={handleRename}
+                    onExport={handleExport}
+                    resumeInChatEnabled={resumeInChatEnabled}
+                    hasChildren={hasChildren}
+                    childrenExpanded={expanded}
+                    onToggleChildren={onToggleChildren}
+                  />
+                );
+              }}
+            />
 
             {showPagination && (
               <SessionsPagination
@@ -2189,6 +2239,9 @@ interface SessionRowProps {
   searchQuery?: string;
   session: SessionInfo;
   snippet?: string;
+  hasChildren: boolean;
+  childrenExpanded: boolean;
+  onToggleChildren: () => void;
 }
 
 interface SessionsPaginationProps {

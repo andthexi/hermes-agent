@@ -369,7 +369,11 @@ def _(rid, params: dict) -> dict:
         # is reused (by its new key) instead of rebuilding a duplicate agent on the
         # stale parent. Skipped for lazy watch windows, which intentionally attach
         # to the exact child branch they were opened on.
-        if found and not is_truthy_value(params.get("lazy", False)):
+        if (
+            found
+            and not is_truthy_value(params.get("lazy", False))
+            and not is_truthy_value(params.get("exact", False))
+        ):
             try:
                 tip = db.resolve_resume_session_id(target)
             except Exception:

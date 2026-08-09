@@ -303,6 +303,7 @@ function appendQueryParam(url: string, key: string, value?: string): string {
 export interface SessionQueryOptions {
   profile?: string;
   order?: "created" | "recent";
+  tree?: boolean;
   source?: string | null;
   sources?: string[];
   excludeSources?: string[];
@@ -330,6 +331,9 @@ function appendSessionFilters(url: string, options: SessionQueryOptions): string
   }
   if (options.excludeSources && options.excludeSources.length > 0) {
     next = appendQueryParam(next, "exclude_sources", options.excludeSources.join(","));
+  }
+  if (options.tree) {
+    next = appendQueryParam(next, "tree", "true");
   }
   return appendProfileParam(next, options.profile);
 }
@@ -383,10 +387,21 @@ export const api = {
       ),
     );
   },
-  getSessionMessages: (id: string, profile = getManagementProfile()) =>
+  getSessionMessages: (
+    id: string,
+    profile = getManagementProfile(),
+    options?: { exact?: boolean },
+  ) =>
     fetchJSON<SessionMessagesResponse>(
       appendProfileParam(
-        `/api/sessions/${encodeURIComponent(id)}/messages?limit=500&order=latest`,
+        `/api/sessions/${encodeURIComponent(id)}/messages?limit=500&order=latest${options?.exact ? "&exact=true" : ""}`,
+        profile,
+      ),
+    ),
+  getSessionChildren: (id: string, profile = getManagementProfile()) =>
+    fetchJSON<SessionChildrenResponse>(
+      appendProfileParam(
+        `/api/sessions/${encodeURIComponent(id)}/children`,
         profile,
       ),
     ),
@@ -1365,6 +1380,9 @@ export interface DebugShareResponse {
 export interface SessionStoreStats {
   total: number;
   active_store: number;
+  /** Raw rows, including hidden child sessions; diagnostic only. */
+  stored_total?: number;
+  stored_active?: number;
   archived: number;
   messages: number;
   by_source: Record<string, number>;
@@ -1886,6 +1904,8 @@ export interface StatusResponse {
   version: string;
 }
 
+export type SessionKind = "root" | "subagent" | "branch" | "compression" | "other";
+
 export interface SessionInfo {
   id: string;
   source: string | null;
@@ -1901,6 +1921,17 @@ export interface SessionInfo {
   output_tokens: number;
   preview: string | null;
   parent_session_id?: string | null;
+  kind?: SessionKind;
+  has_children?: boolean;
+  child_count?: number;
+  archived?: boolean;
+  pinned?: boolean;
+  profile?: string;
+}
+
+export interface SessionChildrenResponse {
+  parent_session_id: string;
+  children: SessionInfo[];
 }
 
 export interface SessionLatestDescendantResponse {

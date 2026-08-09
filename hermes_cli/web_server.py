@@ -11140,10 +11140,11 @@ async def cancel_oauth_session(
 
 
 def _session_latest_descendant(session_id: str, db):
-    """Resolve a session id to the newest child leaf session.
+    """Resolve a session id for the legacy compatibility endpoint.
 
-    /model may create child sessions. Dashboard refresh should continue the
-    newest child instead of reopening the old parent.
+    Explicit Dashboard selections do not call this helper anymore. The
+    endpoint remains broad for older clients and for cycle-safety tests; all
+    new Dashboard PTY launches carry the requested ID unchanged instead.
     """
     def row_get(row, key, index):
         if isinstance(row, dict):
@@ -11166,7 +11167,6 @@ def _session_latest_descendant(session_id: str, db):
         or getattr(db, "connection", None)
         or getattr(db, "_connection", None)
     )
-
     rows = []
     if conn is not None:
         raw_rows = conn.execute(
@@ -11207,7 +11207,6 @@ def _session_latest_descendant(session_id: str, db):
     current = sid
     path = [sid]
     seen = {sid}
-
     while children.get(current):
         candidates = [r for r in children[current] if r.get("id") not in seen]
         if not candidates:
@@ -11216,7 +11215,6 @@ def _session_latest_descendant(session_id: str, db):
         current = candidates[0]["id"]
         path.append(current)
         seen.add(current)
-
     return current, path
 
 
@@ -11261,6 +11259,7 @@ from hermes_cli.web_routers.sessions import (  # noqa: E402,F401 — legacy re-e
     delete_empty_sessions_endpoint,
     get_session_stats,
     get_session_detail,
+    get_session_children,
     get_session_latest_descendant,
     get_session_messages,
     delete_session_endpoint,
@@ -15047,17 +15046,12 @@ def _resolve_chat_argv(
         env["HERMES_HOME"] = str(profile_dir)
 
     if resume:
-        _resume_db = _open_session_db_for_profile(
-            requested if profile_dir is not None else None,
-            read_only=True,
-        )
-        try:
-            latest_resume, _latest_path = _session_latest_descendant(resume, _resume_db)
-        finally:
-            _resume_db.close()
-        if latest_resume:
-            resume = latest_resume
+        # ``resume`` came from an explicit Dashboard selection. Preserve it
+        # verbatim through the PTY boundary; the TUI receives an exact-resume
+        # flag and can therefore open a branch, subagent, or compression
+        # segment without resolving to an unrelated descendant.
         env["HERMES_TUI_RESUME"] = resume
+        env["HERMES_TUI_EXACT_RESUME"] = "1"
 
     if sidecar_url:
         env["HERMES_TUI_SIDECAR_URL"] = sidecar_url

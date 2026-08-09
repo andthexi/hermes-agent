@@ -244,6 +244,45 @@ def _delegate_from_json(col: str = "model_config") -> str:
     return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
 
 
+def _session_model_marker(row: Dict[str, Any], key: str) -> Optional[str]:
+    """Read a lineage marker from a session row's JSON model config."""
+    config = row.get("model_config")
+    if isinstance(config, dict):
+        value = config.get(key)
+    else:
+        try:
+            value = json.loads(config or "{}").get(key)
+        except (TypeError, ValueError, AttributeError):
+            value = None
+    return str(value) if value is not None else None
+
+
+def classify_session_child(
+    child: Dict[str, Any], parent: Dict[str, Any]
+) -> str:
+    """Classify a direct child without treating ``source`` as lineage.
+
+    Stable delegation/branch markers win over the compression fallback. This
+    keeps internal subagents and explicit branches visible in the Dashboard
+    tree without allowing them to hijack compression-aware resume paths.
+    """
+    parent_id = str(parent.get("id") or "")
+    if _session_model_marker(child, "_delegate_from") == parent_id:
+        return "subagent"
+    if _session_model_marker(child, "_branched_from") == parent_id:
+        return "branch"
+    if (
+        parent.get("end_reason") == "branched"
+        and child.get("started_at") is not None
+        and parent.get("ended_at") is not None
+        and child.get("started_at") >= parent.get("ended_at")
+    ):
+        return "branch"
+    if parent.get("end_reason") == "compression" and child.get("source") != "tool":
+        return "compression"
+    return "other"
+
+
 # Sentinel returned by SessionDB._merge_model_config_json when the session row
 # doesn't exist and on_missing="skip" — distinguishes "no row" from the legal
 # None result ("merged config is empty → store NULL").
@@ -6486,6 +6525,50 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             current = child_id
         return current
 
+    def list_session_children(
+        self,
+        parent_session_id: str,
+        *,
+        include_archived: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Return direct child-session metadata without loading transcripts."""
+        parent = self.get_session(parent_session_id)
+        if not parent:
+            return []
+        where = "s.parent_session_id = ?"
+        params: List[Any] = [parent_session_id]
+        if not include_archived:
+            where += " AND s.archived = 0"
+        query = f"""
+            SELECT s.*,
+                COALESCE(
+                    (SELECT {_PREVIEW_RAW_SELECT}
+                     FROM messages m
+                     WHERE m.session_id = s.id
+                       AND m.role = 'user'
+                       AND m.content IS NOT NULL
+                     ORDER BY m.timestamp, m.id LIMIT 1),
+                    ''
+                ) AS _preview_raw,
+                {_sql_session_last_active('s')} AS last_active,
+                (SELECT COUNT(*) FROM sessions child
+                 WHERE child.parent_session_id = s.id) AS child_count
+            FROM sessions s
+            WHERE {where}
+            ORDER BY s.started_at ASC, s.id ASC
+        """
+        with self._read_ctx() as conn:
+            rows = conn.execute(query, params).fetchall()
+        result: List[Dict[str, Any]] = []
+        for raw in rows:
+            child = self._session_row_dict(raw)
+            child["preview"] = _shape_preview(child.pop("_preview_raw", ""))
+            child["kind"] = classify_session_child(child, parent)
+            child["child_count"] = int(child.get("child_count") or 0)
+            child["has_children"] = child["child_count"] > 0
+            result.append(child)
+        return result
+
     # Columns excluded from compact_rows projections: only the payload-heavy
     # blob no list consumer renders. Everything else — including gateway
     # routing fields and desktop sidebar fields like git_branch — stays, and
@@ -6516,6 +6599,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         compact_rows: bool = False,
         include_pinned: bool = False,
         session_key: str = None,
+        top_level_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -6568,6 +6652,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Pass ``session_key`` to restrict results to one stable gateway
         conversation scope (DM, group, channel, or thread, including the
         configured per-user isolation policy).
+
+        Pass ``top_level_only=True`` for a tree projection. This returns only
+        parentless rows and deliberately disables compression-tip projection;
+        callers can then load every direct child by exact ID.
         """
         # Rows carry token/cost totals — drain queued deltas first so
         # listings (sidebar, /resume, dashboards) show exact counters.
@@ -6575,7 +6663,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         where_clauses = []
         params = []
 
-        if not include_children:
+        if top_level_only:
+            where_clauses.append("s.parent_session_id IS NULL")
+        elif not include_children:
             # Show root sessions and branch sessions, while still hiding
             # sub-agent runs and compression continuations (which also carry a
             # parent_session_id but were spawned while the parent was still
@@ -6772,6 +6862,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             s.pop("_effective_last_active", None)
             sessions.append(s)
 
+        if top_level_only and sessions:
+            root_ids = [s["id"] for s in sessions]
+            placeholders = ",".join("?" for _ in root_ids)
+            with self._read_ctx() as conn:
+                child_counts = {
+                    row["parent_session_id"]: int(row["child_count"] or 0)
+                    for row in conn.execute(
+                        "SELECT parent_session_id, COUNT(*) AS child_count "
+                        f"FROM sessions WHERE parent_session_id IN ({placeholders}) "
+                        "GROUP BY parent_session_id",
+                        root_ids,
+                    ).fetchall()
+                }
+            for s in sessions:
+                count = child_counts.get(s["id"], 0)
+                s["child_count"] = count
+                s["has_children"] = count > 0
+
         # Back-fill pinned conversations the page missed. A pin outlives
         # recency, so this runs BEFORE compression projection below — a
         # back-filled root then projects to its live tip exactly like a row
@@ -6809,6 +6917,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if s["id"] in seen_ids:
                     continue
                 s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
+                if top_level_only:
+                    with self._read_ctx() as conn:
+                        count = conn.execute(
+                            "SELECT COUNT(*) FROM sessions "
+                            "WHERE parent_session_id = ?",
+                            (s["id"],),
+                        ).fetchone()[0]
+                    s["child_count"] = int(count or 0)
+                    s["has_children"] = s["child_count"] > 0
                 seen_ids.add(s["id"])
                 sessions.append(s)
 
@@ -6818,7 +6935,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # end_reason, preview) with the tip's values so the list entry acts
         # as the live conversation. Keep the root's started_at to preserve
         # chronological ordering by original conversation start.
-        if project_compression_tips and not include_children:
+        if project_compression_tips and not include_children and not top_level_only:
             # get_compression_tip() walks each root's chain individually (it's
             # a per-session graph walk, not batchable in one query), but the
             # tip *row* fetch afterward was previously one _get_session_rich_row()
@@ -8592,6 +8709,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         archived_only: bool = False,
         exclude_children: bool = False,
         exclude_sources: List[str] = None,
+        top_level_only: bool = False,
     ) -> int:
         """Count sessions, optionally filtered by source.
 
@@ -8610,7 +8728,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         where_clauses = []
         params = []
 
-        if exclude_children:
+        if top_level_only:
+            where_clauses.append("s.parent_session_id IS NULL")
+        elif exclude_children:
             # Mirror list_sessions_rich's child-exclusion clause exactly so the
             # count lines up with the rows: roots (no parent) plus branch
             # children (parent ended with end_reason='branched').
@@ -8665,6 +8785,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_archived: bool = False,
         archived_only: bool = False,
         exclude_children: bool = False,
+        top_level_only: bool = False,
     ) -> Dict[str, int]:
         """Return a ``{source: count}`` dict via a single ``GROUP BY`` query.
 
@@ -8682,7 +8803,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         where_clauses = []
         params: list = []
 
-        if exclude_children:
+        if top_level_only:
+            where_clauses.append("s.parent_session_id IS NULL")
+        elif exclude_children:
             where_clauses.append(_LISTABLE_CHILD_SQL)
             where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
         if archived_only:

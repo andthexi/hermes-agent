@@ -349,6 +349,52 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
     ]
 
 
+def test_session_resume_exact_skips_descendant_resolution(server, monkeypatch):
+    seen = []
+
+    class _DB:
+        def get_session(self, sid):
+            return {"id": sid, "message_count": 1}
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, sid):
+            seen.append(sid)
+            return "unrelated-descendant"
+
+        def get_resume_conversations(self, session_id):
+            history = [{"role": "user", "content": session_id}]
+            return history, history
+
+        def reopen_session(self, _sid):
+            return None
+
+        def get_ancestor_display_prefix(self, _sid):
+            return []
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_make_agent", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(server, "_init_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args, **_kwargs: {"model": "test/model"})
+
+    response = server.handle_request(
+        {
+            "id": "r-exact",
+            "method": "session.resume",
+            "params": {
+                "session_id": "selected-child",
+                "exact": True,
+                "eager_build": True,
+            },
+        }
+    )
+
+    assert "error" not in response
+    assert response["result"]["resumed"] == "selected-child"
+    assert seen == []
+
+
 def test_session_resume_rejects_runaway_transcript_before_history_load(
     server, monkeypatch
 ):
