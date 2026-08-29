@@ -44,8 +44,6 @@ import { $sessionTiles, $workingSessionIds, clearAllSessionStates, publishSessio
 
 import { deferred } from '../../../test/deferred'
 
-import { deferred } from '../../../test/deferred'
-
 import { takeGatewaySurvivor } from './gateway-hmr-survivor'
 import { primaryRuntimeConnectionId, useGatewayBoot } from './use-gateway-boot'
 
