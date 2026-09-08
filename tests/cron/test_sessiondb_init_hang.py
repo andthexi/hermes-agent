@@ -89,22 +89,20 @@ class TestSessionDbInitTimeout:
         profile_home = tmp_path / "profiles" / "jobsearch"
         monkeypatch.setenv("HERMES_HOME", str(default_home))
         observed_homes = []
-        observed_paths = []
         fake_db = MagicMock()
 
-        def make_session_db(*, db_path=None):
+        def make_session_db(*args, **kwargs):
             observed_homes.append(get_hermes_home())
-            observed_paths.append(db_path)
             return fake_db
 
         job = {"id": "profile-sessiondb", "name": "test", "prompt": "hello"}
         profile_token = set_hermes_home_override(profile_home)
         try:
             with patch("cron.scheduler._hermes_home", None), \
-                 patch("cron.scheduler._resolve_origin", return_value=None), \
+                 patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
                  patch("hermes_cli.env_loader.load_hermes_dotenv"), \
                  patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-                 patch("hermes_state.SessionDB", side_effect=make_session_db), \
+                 patch("hermes_state_registry.acquire", side_effect=make_session_db), \
                  patch(
                      "hermes_cli.runtime_provider.resolve_runtime_provider",
                      return_value=_RUNTIME,
@@ -122,7 +120,6 @@ class TestSessionDbInitTimeout:
         assert error is None
         assert final_response == "ok"
         assert observed_homes == [profile_home]
-        assert observed_paths == [profile_home / "state.db"]
 
     def test_run_job_does_not_hang_when_sessiondb_init_wedges(self, tmp_path, monkeypatch):
         """run_job proceeds without a session store when SessionDB init times out."""
@@ -131,10 +128,10 @@ class TestSessionDbInitTimeout:
         timeouts: list = []
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB"), \
+             patch("hermes_state_registry.acquire"), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value=_RUNTIME,
@@ -166,10 +163,10 @@ class TestSessionDbInitTimeout:
         timeouts: list = []
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_state_registry.acquire", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value=_RUNTIME,
@@ -209,10 +206,10 @@ class TestSessionDbInitTimeout:
         timeouts: list = []
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB"), \
+             patch("hermes_state_registry.acquire"), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value=_RUNTIME,
@@ -259,10 +256,10 @@ class TestDispatchGuardReleasedAfterHang:
 
         try:
             with patch("cron.scheduler._hermes_home", tmp_path), \
-                 patch("cron.scheduler._resolve_origin", return_value=None), \
+                 patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
                  patch("hermes_cli.env_loader.load_hermes_dotenv"), \
                  patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-                 patch("hermes_state.SessionDB"), \
+                 patch("hermes_state_registry.acquire"), \
                  patch(
                      "hermes_cli.runtime_provider.resolve_runtime_provider",
                      return_value=_RUNTIME,
@@ -347,7 +344,7 @@ class TestLateSessionDbClosedAfterTimeout:
         never_set = threading.Event()
         late_db_holder = []  # captures the SessionDB returned by the late init
 
-        def _hanging_then_capture(**_kwargs):
+        def _hanging_then_capture():
             never_set.wait(timeout=30)
             db = MagicMock()
             late_db_holder.append(db)
@@ -357,10 +354,10 @@ class TestLateSessionDbClosedAfterTimeout:
 
         try:
             with patch("cron.scheduler._hermes_home", tmp_path), \
-                 patch("cron.scheduler._resolve_origin", return_value=None), \
+                 patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
                  patch("hermes_cli.env_loader.load_hermes_dotenv"), \
                  patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-                 patch("hermes_state.SessionDB", side_effect=_hanging_then_capture), \
+                 patch("hermes_state_registry.acquire", side_effect=_hanging_then_capture), \
                  patch(
                      "hermes_cli.runtime_provider.resolve_runtime_provider",
                      return_value={
@@ -415,10 +412,10 @@ class TestSessionDbInitAfterEarlyReturns:
         }
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB") as mock_db_cls, \
+             patch("hermes_state_registry.acquire") as mock_db_cls, \
              patch(
                  "cron.scheduler._run_job_script_with_claim_heartbeat",
                  return_value=(True, '{"wakeAgent": false}'),
