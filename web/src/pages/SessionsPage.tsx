@@ -79,6 +79,7 @@ import {
   SessionTreeToggle,
   type SessionTreeNodeProps,
 } from "@/components/SessionTree";
+import { apiErrorFromResponse, errorMessage } from "@/lib/api-error";
 
 const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
   {
@@ -95,6 +96,7 @@ const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
     sms: { icon: MessageCircle, color: "text-success" },
     cron: { icon: Clock, color: "text-warning" },
     tool: { icon: Play, color: "text-warning" },
+    oneshot: { icon: Terminal, color: "text-warning" },
     api_server: { icon: Globe, color: "text-muted-foreground" },
     acp: { icon: Database, color: "text-muted-foreground" },
     hermes_flow: { icon: Play, color: "text-warning" },
@@ -105,6 +107,7 @@ const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
 const AUTOMATION_SESSION_SOURCES = [
   "cron",
   "tool",
+  "oneshot",
   "api_server",
   "acp",
   "hermes_flow",
@@ -495,12 +498,12 @@ function SessionRow({
     if (!isExpanded || messages !== null) return;
     let cancelled = false;
     api
-      .getSessionMessages(session.id, getManagementProfile(), { exact: true })
+      .getSessionMessages(session.id, session.profile || getManagementProfile(), { exact: true })
       .then((resp) => {
         if (!cancelled) setMessages(resp.messages);
       })
       .catch((err) => {
-        if (!cancelled) setError(String(err));
+        if (!cancelled) setError(errorMessage(err));
       });
     return () => {
       cancelled = true;
@@ -1103,7 +1106,7 @@ export default function SessionsPage() {
         loadStats();
         refreshEmptyCount();
       } catch (error) {
-        showToast(`Import failed: ${error}`, "error");
+        showToast(`Import failed: ${errorMessage(error)}`, "error");
       } finally {
         setImportingSessions(false);
         if (importInputRef.current) importInputRef.current.value = "";
@@ -1301,10 +1304,11 @@ export default function SessionsPage() {
   // the global management profile, which lags the row (it stays "" while the
   // sticky active profile equals the dashboard process's own, so the request
   // hits the process store — a delete then "succeeds" as already_absent).
-  // Search rows carry no stamp: undefined falls back to the management profile.
+  // Current search rows carry the same stamp; an unstamped row from an older
+  // backend still falls back to the management profile.
   const rowProfile = useCallback(
-    (id: string) => sessions.find((s) => s.id === id)?.profile,
-    [sessions],
+    (id: string) => (searchResults ?? sessions).find((s) => s.id === id)?.profile,
+    [searchResults, sessions],
   );
 
   const sessionDelete = useConfirmDelete({
@@ -1521,7 +1525,9 @@ export default function SessionsPage() {
                 .__HERMES_SESSION_TOKEN__ ?? "",
           },
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) {
+          throw apiErrorFromResponse(res.status, await res.text().catch(() => ""), res.url);
+        }
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
