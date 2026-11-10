@@ -9983,6 +9983,11 @@
             "default": false,
             "title": "Display Projection",
             "type": "boolean"
+          },
+          "exact": {
+            "default": false,
+            "title": "Exact",
+            "type": "boolean"
           }
         },
         "title": "CanonicalResumeParams",

@@ -83,6 +83,9 @@ class CanonicalResumeParams(ProfileParams):
     # A renderer (the Ink TUI) asks for main's display projection of the same rows
     # (``tui_gateway.session_history._history_to_messages``) as ``display_messages``.
     display_projection: bool = False
+    # Prefer a Dashboard SessionTree selection's physical compression/session segment; when a
+    # canonical compression route has already advanced, the owner retains its current tip.
+    exact: bool = False
 
 
 class CanonicalSessionHandle(Result):

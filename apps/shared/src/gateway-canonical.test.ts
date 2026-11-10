@@ -16,6 +16,13 @@ it('mints the session.create request_id outside a secure context', () => {
   expect(request.params).toEqual({ source: 'tui', request_id: '07070707-0707-4707-8707-070707070707' })
 })
 
+it('preserves exact resume selection while requesting the canonical display projection', () => {
+  expect(canonicalRequest('session.resume', { session_id: 's', exact: true })).toEqual({
+    method: 'session.resume',
+    params: { session_id: 's', exact: true, display_projection: true }
+  })
+})
+
 // The launch identity: no identity is main's request and wording; another source or a client name is
 // honored when the owner advertises it and refused in neutral words when it does not.
 const owner = { sources: ['cli', 'tui'], parameters: ['source', 'request_id', 'model', 'client_env'] }

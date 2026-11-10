@@ -47,6 +47,32 @@ def _seed(db):
     db.end_session('old-tui', 'tui_shutdown')
 
 
+def _seed_compression_segments(db):
+    db.create_session('resume-parent', source='tui', model='fake-model')
+    db.append_message('resume-parent', 'user', 'parent segment')
+    db.end_session('resume-parent', 'compression')
+    db.create_session('resume-child', source='tui', model='fake-model', parent_session_id='resume-parent')
+    db.append_message('resume-child', 'user', 'child segment')
+
+
+@pytest.mark.asyncio
+async def test_exact_resume_keeps_the_selected_compression_segment(tmp_path, monkeypatch):
+    db, native = await _native(tmp_path, monkeypatch)
+    _seed_compression_segments(db)
+
+    exact = await native.dispatch({'id': 1, 'method': 'session.resume',
+                                   'params': {'session_id': 'resume-child', 'exact': True}})
+    assert 'result' in exact, exact
+    assert exact['result']['session_id'] == 'resume-child'
+    assert exact['result']['messages'][-1]['content'] == 'child segment'
+
+    normal = await native.dispatch({'id': 2, 'method': 'session.resume',
+                                    'params': {'session_id': 'resume-parent'}})
+    assert 'result' in normal, normal
+    assert normal['result']['session_id'] == 'resume-child'
+    assert normal['result']['messages'][-1]['content'] == 'child segment'
+
+
 @pytest.mark.asyncio
 async def test_resume_display_projection_matches_main(tmp_path, monkeypatch):
     db, native = await _native(tmp_path, monkeypatch)

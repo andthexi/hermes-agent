@@ -5245,6 +5245,7 @@ export interface CanonicalResumeParams {
   omit_messages?: boolean
   cols?: number | null
   display_projection?: boolean
+  exact?: boolean
 }
 export interface CanonicalListParams {
   profile?: string | null

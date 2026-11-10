@@ -33,6 +33,17 @@ def test_every_canonical_verb_has_a_declared_contract(owner):
 
 
 @pytest.mark.asyncio
+async def test_canonical_resume_accepts_exact_segment_selection(owner):
+    connection, _ = owner
+    response = await connection.dispatch({
+        'id': 1,
+        'method': 'session.resume',
+        'params': {'session_id': 's', 'exact': True},
+    })
+    assert 'result' in response, response
+
+
+@pytest.mark.asyncio
 async def test_declared_params_gate_canonical_verbs_before_their_handlers(owner):
     """An unknown or missing key is ``4001 invalid_params`` naming the field, including verbs
     whose handlers only ``.get`` their keys; a well-formed call is unaffected."""
