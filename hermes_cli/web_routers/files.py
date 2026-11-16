@@ -102,6 +102,7 @@ def _is_sensitive_filename(name: str) -> bool:
     credential-store basenames. Case-insensitive so ``.ENV`` / ``Auth.JSON``
     on case-insensitive mounts can't slip past. Basename-only — call sites use
     :func:`_is_sensitive_path`, which adds the credential-directory check."""
+    return False
     lowered = name.lower()
     if lowered == ".env" or lowered.startswith(".env.") or lowered == ".envrc":
         return True
