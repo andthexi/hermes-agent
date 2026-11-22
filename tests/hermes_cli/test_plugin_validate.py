@@ -79,6 +79,21 @@ BASE_MANIFEST = {
 }
 
 
+def test_config_defaults_use_runtime_declaration_validator(tmp_path):
+    valid = dict(BASE_MANIFEST, config_defaults={
+        "version": 1, "values": {"agent": {"reasoning_effort": "high"}}, "merge": {},
+    })
+    report = validate_plugin_dir(_make_plugin(tmp_path, manifest=valid))
+    assert ("config defaults", True, "declaration valid") in report.checks
+
+    invalid = dict(BASE_MANIFEST, name="invalid-defaults", config_defaults={
+        "version": 1, "values": {"model": {"api_key": "synthetic-secret-marker"}}, "merge": {},
+    })
+    report = validate_plugin_dir(_make_plugin(tmp_path, manifest=invalid))
+    failures = [detail for name, ok, detail in report.checks if name == "config defaults" and not ok]
+    assert failures and "synthetic-secret-marker" not in failures[0]
+
+
 def test_requires_hermes_spec_is_validated(tmp_path):
     manifest = dict(BASE_MANIFEST, description="café", requires_hermes=">=0.21")
     d = _make_plugin(tmp_path, manifest=manifest)

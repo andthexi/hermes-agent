@@ -10,8 +10,11 @@ import {
   credentialPreview,
   diffConfig,
   enumOptionsFor,
+  explicitConfigPatch,
+  explicitConfigPaths,
   getNested,
   isExternalMemoryProvider,
+  mergeConfigPatch,
   providerGroup,
   sectionFieldEntries,
   setConfigField,
@@ -446,7 +449,52 @@ describe('settings helpers', () => {
   })
 
   describe('diffConfig', () => {
-    it('omits a top-level key the draft never touched', () => {
+    it('builds explicit patches from edited paths even when values equal effective defaults', () => {
+    const effective: HermesConfigRecord = {
+      agent: { reasoning_effort: 'high' },
+      display: { compact: false }
+    }
+
+    expect(explicitConfigPatch(effective, ['agent.reasoning_effort'])).toEqual({
+      agent: { reasoning_effort: 'high' }
+    })
+    expect(explicitConfigPatch(effective, [])).toEqual({})
+  })
+
+  it('marks supplied import leaves as explicit intent', () => {
+    expect(explicitConfigPaths({
+      agent: { reasoning_effort: 'high' },
+      skills: { external_dirs: ['local'] },
+      display: { compact: false }
+    })).toEqual(['agent.reasoning_effort', 'skills.external_dirs', 'display.compact'])
+  })
+
+  it('round-trips literal dots in imported config key segments', () => {
+    const imported = JSON.parse(
+      '{"providers":{"stranerd-foundry":{"models":{"gpt-6.1-sol":{"supports_vision":true}}}}}'
+    ) as HermesConfigRecord
+    const paths = explicitConfigPaths(imported)
+
+    expect(paths).toEqual(['providers.stranerd-foundry.models.gpt-6\\.1-sol.supports_vision'])
+    expect(explicitConfigPatch(imported, paths)).toEqual(imported)
+    expect(mergeConfigPatch({}, imported)).toEqual(imported)
+  })
+
+  it('rejects prototype-sensitive imported keys without changing Object.prototype', () => {
+    const marker = 'hermes_config_import_proto_probe'
+    const imported = JSON.parse(`{"__proto__":{"${marker}":true}}`) as HermesConfigRecord
+    delete (Object.prototype as Record<string, unknown>)[marker]
+    try {
+      expect(() => explicitConfigPaths(imported)).toThrow()
+      expect(() => explicitConfigPatch(imported, [`__proto__.${marker}`])).toThrow()
+      expect(() => mergeConfigPatch({}, imported)).toThrow()
+      expect(Object.prototype.hasOwnProperty.call(Object.prototype, marker)).toBe(false)
+    } finally {
+      delete (Object.prototype as Record<string, unknown>)[marker]
+    }
+  })
+
+  it('omits a top-level key the draft never touched', () => {
       // The autosave baseline is a snapshot taken when Settings opened. A key
       // an agent set via `hermes config set` while the page sat open must not
       // come back in the patch just because it's still present in the draft.

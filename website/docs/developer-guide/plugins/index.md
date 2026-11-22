@@ -621,12 +621,40 @@ this Hermes understands still loads with a warning.
 | `python_runtime` | str | `external` — the plugin manages its own interpreter/venv (sidecar pattern); Hermes installs nothing and leaves any `pyproject.toml` alone. |
 | `config_schema` | mapping | JSON-schema-ish description of keys under `plugins.entries.<id>.settings`: `api_url: {type: str, default: "", description: "...", required: false}`. Validated at load; mismatches log actionable warnings naming the key and expected type — never load failures. Types: `str`, `int`, `float`, `bool`, `list`, `dict` (plus JSON-schema aliases) and `secret`. Also drives the settings form in the Desktop Plugins tab — see [Settings form in the Desktop](#settings-form-in-the-desktop). |
 | `config_keys` | list | Dotted paths in Hermes' own config sections that your code reads (e.g. `memory.retaindb`). Each path covers itself and everything below it, so `hermes config get/set` recognizes those keys instead of warning "not a recognized config key", but only while the plugin is active (enabled, or the selected `memory.provider`). A path must be at least two segments deep, and paths Hermes already defines are ignored, so a declaration never hides a typo elsewhere in the section. Settings for your plugin alone belong in `config_schema`; use this only for a core section your plugin reads. Portable `plugin.json` packages put it under `extensions."com.nousresearch.hermes".config_keys`. |
+| `config_defaults` | mapping | Optional versioned, declarative read-time config defaults; see [Manifest config defaults](#manifest-config-defaults). Values never execute plugin code and never write themselves into the user's YAML. |
 | `license` | str | SPDX-style license id (e.g. `MIT`). |
 | `homepage` | str | Project URL. |
 | `tags` | list of str | Free-form discovery tags (e.g. `[gateway, telegram]`). |
 | `provides_locales` | list | Language pack declaration: ids (`- pl`) or `{id, endonym, rtl}` mappings whose `locales/<id>[.tui\|.desktop].yaml` the loader registers automatically — see [Ship a language pack](#ship-a-language-pack). |
 | `requires_auth` | list of str | Providers whose sign-in the plugin uses through Hermes (today: `openai-codex`). Required by `credentialed_provider_request`; shown at install and in `hermes plugins show`. See [Use the user's Codex sign-in](#use-the-users-codex-sign-in-core-made-requests). |
 | `oauth` | list of mappings | OAuth clients the plugin uses through Hermes: `id`, `authorize_url`, `token_url`, `scopes`, `client_id_env`, optional `client_secret_env`, `hosts`, optional `authorize_params`. Signed in with `hermes auth add <plugin>:<id>`, used through `credentialed_provider_request`. See [Use your own OAuth client](#use-your-own-oauth-client-google-and-other-apis). |
+
+### Manifest config defaults
+
+`config_defaults` is an optional, data-only capability with its own version, independent of `manifest_version` and the native plugin API generation. It applies only when the winning manifest is explicitly named in the profile's `plugins.enabled`; `plugins.disabled` wins. A model-provider manifest is not enabled for defaults merely because provider discovery can register it. The loader reads manifests without importing plugin Python or resolving secret sources.
+
+```yaml
+config_defaults:
+  version: 1
+  values:
+    agent:
+      reasoning_effort: high
+    skills:
+      external_dirs:
+        - ~/.agents/skills
+  merge:
+    skills.external_dirs: append_unique
+```
+
+`values` is a nested mapping of JSON-compatible values. Hermes rejects malformed shapes, recursive YAML aliases, non-finite numbers, YAML date/time objects, non-string keys, unknown config roots, and credential-shaped values. Defaults cannot set `plugins`, `_config_version`, config-backend/deployment selectors, or credential fields. The concrete non-secret `secrets.command.enabled`, `secrets.command.command`, and `secrets.command.override_existing` settings are allowed for bootstrap; a command string must name a file/helper, never embed a credential literal.
+
+Ordinary leaves use deterministic **first contributor wins** order: dependency-first, alphabetical for ties. This is only config-default precedence; same-plugin source replacement is unchanged, and model-provider registry registration remains native last-writer-wins. For list fields, the default is replacement unless that declaration names `append_unique`. Each merge path must refer to a list in its declaration. The user layer remains first in the merged list, then compatible plugin entries in contributor order, with stable deduplication. An absent or empty raw list inherits; explicit `null` blocks plugin entries. For every type, an explicitly present user value—including `null`, `false`, `0`, `""`, `[]`, or a value equal to the plugin default—wins. A null/non-mapping ancestor is not rebuilt to inject a child.
+
+Plugin values are effective-read data, never writable YAML. `GET /api/config` is the effective view; `GET /api/config?include_defaults=false`, raw YAML editing, exports, and explicit-source writes operate on the user document. A whole-document REST `PUT` with active plugin defaults must carry `write_mode: explicit_patch` and only intentional raw edits; legacy ambiguous full-document writes are refused for those profiles. Reset/unset removes the user's source value so the current defaults show again. List editors use raw user additions, not an effective merged list. Managed values still win after user values.
+
+A malformed enabled declaration makes that profile's effective read fail with a plugin/path diagnostic; it is not replaced with a built-in value. The raw config editor and plugin-disable path remain available to recover, and other profiles continue independently. Manifest changes affect new reads/new conversations through profile-bound cache signatures; existing conversations keep their cached prompt/tool prefix. Workers with a frozen policy use their owner-provided snapshot and do not rediscover plugins or secrets.
+
+The public compatibility marker for provider plugins that require this capability is `hermes_cli.config_plugin_defaults.CONFIG_DEFAULTS_VERSION == 1`; no internal composition or discovery helper is part of the plugin API.
 
 ```yaml
 # plugin.yaml — manifest v2 example

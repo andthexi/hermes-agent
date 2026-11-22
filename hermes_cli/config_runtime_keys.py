@@ -29,6 +29,9 @@ logger = logging.getLogger(__name__)
 
 # Core-owned keys read at runtime but deliberately absent from DEFAULT_CONFIG -> their reader.
 CORE_RUNTIME_KEYS: dict[str, str] = {
+    "agent.max_turns": "hermes_cli/cli_config_load.py::_cli_config_defaults and agent turn limits",
+    "agent.reasoning_effort": "hermes_cli/cli_config_load.py::_cli_config_defaults and the agent reasoning bridge",
+    "agent.service_tier": "hermes_cli/cli_config_load.py::_cli_config_defaults and service-tier routing",
     "computer_use.backend": "plugins/computer_use/__init__.py configured_backend_name() (unset = cua)",
     "dashboard.kanban": "plugins/kanban/dashboard/plugin_api.py (bundled dashboard tab preferences)",
 }

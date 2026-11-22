@@ -118,7 +118,7 @@ def test_pin_persists_per_profile_and_is_honored_by_resolution(two_profile_homes
 
 def test_assignment_reset_and_stale_pins_cover_plugin_tasks(two_profile_homes, monkeypatch):
     saved: dict = {}
-    monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: saved.update(cfg))
+    monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg, **_kwargs: saved.update(cfg))
     cfg: dict = {"auxiliary": {}}
 
     out = _apply_aux_assignment_sync(cfg, "openrouter", "fast-model", "alpha_task", "", "")

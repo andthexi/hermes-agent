@@ -321,7 +321,7 @@ def _set_runtime_enabled(enabled: bool) -> dict:
     with _CONFIG_MUTATION_LOCK:
         config = config_mod.load_config()
         config.setdefault("local_runtime", {})["enabled"] = enabled
-        config_mod.save_config(config)
+        config_mod.save_config(config, preserve_keys={("local_runtime", "enabled")})
     return config
 
 

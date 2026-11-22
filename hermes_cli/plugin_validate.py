@@ -112,6 +112,21 @@ def _check_manifest_fields(report: ValidationReport, manifest: dict) -> None:
         report.add("manifest fields", True, "name, version, description present")
 
 
+def _check_config_defaults(report: ValidationReport, manifest: dict) -> None:
+    """Validate a declared read-time defaults capability with the runtime parser."""
+    if "config_defaults" not in manifest:
+        report.add("config defaults", True, "not declared")
+        return
+    from hermes_cli.config_plugin_defaults import PluginDefaultsError, parse_default_declaration
+
+    try:
+        parse_default_declaration(str(manifest.get("name") or "<unnamed>"), manifest["config_defaults"])
+    except PluginDefaultsError as exc:
+        report.add("config defaults", False, str(exc))
+    else:
+        report.add("config defaults", True, "declaration valid")
+
+
 def _check_requires_hermes(report: ValidationReport, manifest: dict) -> None:
     spec = str(manifest.get("requires_hermes") or "").strip()
     if not spec:
@@ -545,6 +560,7 @@ def validate_plugin_dir(
     report.add("manifest", True, "plugin.yaml parses")
 
     _check_manifest_fields(report, manifest)
+    _check_config_defaults(report, manifest)
     _check_requires_hermes(report, manifest)
     _check_config_spec(report, manifest)
     _check_requires_env(report, manifest)

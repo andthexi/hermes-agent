@@ -47,7 +47,7 @@ def _set_dashboard_key(key: str, value, profile: Optional[str] = None) -> None:
         if "dashboard" not in config:
             config["dashboard"] = {}
         config["dashboard"][key] = value
-        save_config(config)
+        save_config(config, preserve_keys={("dashboard", key)})
 
 
 @router.get("/api/dashboard/themes")

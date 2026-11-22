@@ -44,6 +44,14 @@ backend, the managed scope (`/etc/hermes`) stays an overlay on top of the user l
 backend ignores the managed `config.yaml`: config and locks come only from Remote Config, and
 `hermes doctor` flags the file if it exists. The managed `.env` still applies in both modes.
 
+## Effective config and write intent
+
+`read_config_doc` / `read_user_config_raw` represent the writable user source. `load_config` and `load_user_config_effective` are effective views and may contain built-in defaults, profile-opted plugin `config_defaults`, managed values, and environment expansion. Never serialize an effective view as though every value came from the user document. Writers should use raw source documents plus explicit edited paths; explicit values equal to a current default must remain explicit.
+
+The dashboard's `GET /api/config` is effective; `GET /api/config?include_defaults=false` is raw. A `PUT /api/config` with enabled plugin defaults requires `write_mode: explicit_patch`, where `config` contains only intentional raw edits and `unset_paths` means remove those source paths to inherit again. `null` is a value that blocks inheritance, not an unset. A legacy unmarked full-document PUT is refused with an actionable conflict when plugin defaults are active because untouched and explicit-equal fields are indistinguishable. Profiles without active plugin defaults keep the legacy request behavior. The Dashboard and Desktop send edit intent; imports treat supplied raw keys as intentional, and exports preserve raw overrides rather than an expanded preset.
+
+For `append_unique` list paths, editors use the raw profile contribution. Saving an effective merged list would persist plugin entries into the user's file. The API schema may expose non-secret merge-mode metadata for this purpose.
+
 Related keys that must change together (a model switch's `model.*` keys, the TUI `/focus`
 toggle) go through `write_config_keys(path, {key: value, ...})`. A remote backend sends them
 as one CAS write, so a lock on any of them refuses all of them.

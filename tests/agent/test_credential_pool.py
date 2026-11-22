@@ -584,6 +584,8 @@ def test_load_pool_does_not_persist_env_seeded_secret_value(tmp_path, monkeypatc
     sentinel = "S3NTINEL_DO_NOT_PERSIST_OPENROUTER"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("OPENROUTER_API_KEY", sentinel)
+    from hermes_cli import env_loader
+    monkeypatch.setitem(env_loader._SECRET_SOURCES, "OPENROUTER_API_KEY", "file")
     _write_auth_store(tmp_path, {"version": 1, "providers": {}})
 
     from agent.credential_pool import load_pool
@@ -602,6 +604,7 @@ def test_load_pool_does_not_persist_env_seeded_secret_value(tmp_path, monkeypatc
     assert persisted["label"] == "OPENROUTER_API_KEY"
     assert persisted["auth_type"] == "api_key"
     assert persisted["priority"] == 0
+    assert persisted["secret_source"] == "file"
     assert "access_token" not in persisted
     assert persisted["secret_fingerprint"].startswith("sha256:")
 

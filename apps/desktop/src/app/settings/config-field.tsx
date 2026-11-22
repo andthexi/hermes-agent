@@ -1,19 +1,17 @@
 import { type ReactNode, useEffect, useRef, useState } from 'react'
 
 import { Input } from '@/components/ui/input'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { useI18n } from '@/i18n'
 import { prettyName } from '@/lib/text'
 import { cn } from '@/lib/utils'
-import type { ConfigFieldSchema } from '@/types/hermes'
+import type { ConfigFieldSchema } from '@/types/config-field-schema'
 
-import { ComboboxInput } from './combobox-input'
-import { CONTROL_TEXT, EMPTY_SELECT_VALUE, FIELD_DESCRIPTIONS, FIELD_LABELS, FREE_INPUT_KEYS } from './constants'
+import { renderConfigFieldSelect } from './config-field-select'
+import { CONTROL_TEXT, FIELD_DESCRIPTIONS, FIELD_LABELS } from './constants'
 import { FallbackModelsField } from './fallback-models-field'
 import { fieldCopyForSchemaKey } from './field-copy'
 import { ListRow, ToggleRow } from './primitives'
-import { SearchableSelect } from './searchable-select'
 
 export function parseListFieldDraft(raw: string): string[] {
   return raw
@@ -37,7 +35,9 @@ export function ConfigField({
   enumOptions,
   optionLabels,
   onChange,
-  descriptionExtra
+  descriptionExtra,
+  disabled = false,
+  placeholder
 }: {
   schemaKey: string
   schema: ConfigFieldSchema
@@ -46,6 +46,8 @@ export function ConfigField({
   optionLabels?: Record<string, string>
   onChange: (value: unknown) => void
   descriptionExtra?: ReactNode
+  disabled?: boolean
+  placeholder?: string
 }) {
   const { t } = useI18n()
   const c = t.settings.config
@@ -74,14 +76,16 @@ export function ConfigField({
     rawDescription && normalizedDesc !== normalize(label) && normalizedDesc !== normalize(schemaKey)
       ? rawDescription
       : undefined
+  const mergeDescription = schema.plugin_default ? schema.merge_description : undefined
+  const fullDescription = [description, mergeDescription].filter(Boolean).join(' ')
 
   const descriptionNode: ReactNode = descriptionExtra ? (
     <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
-      {description}
+      {fullDescription}
       {descriptionExtra}
     </span>
   ) : (
-    description
+    fullDescription || undefined
   )
 
   // Every config row is addressable by its canonical schema key, so a tour can
@@ -125,66 +129,19 @@ export function ConfigField({
   }
 
   const selectOptions = enumOptions ?? (schema.type === 'select' ? (schema.options ?? []).map(String) : undefined)
+  const selectField = renderConfigFieldSelect({
+    copy: c,
+    onChange,
+    optionLabels,
+    options: selectOptions,
+    renderRow: row,
+    schema,
+    schemaKey,
+    value
+  })
 
-  // Large closed-world lists (e.g. ~590 IANA timezones) get a searchable
-  // Popover + cmdk combobox instead of a closed Select dropdown.  The schema
-  // opt-in via `searchable: true` keeps this deterministic — no field
-  // accidentally triggers based on dynamic option count.
-  if (selectOptions && schema.searchable) {
-    return row(
-      <SearchableSelect
-        clearLabel={schema.clearable ? c.systemDefault : undefined}
-        emptyMessage={c.noResults}
-        onChange={next => onChange(next)}
-        options={selectOptions.filter(o => o !== '')}
-        placeholder={c.searchPlaceholder}
-        value={String(value ?? '')}
-      />
-    )
-  }
-
-  // Voice/model name fields are open-world (custom voice IDs, cloned voices,
-  // brand-new model names) — render a free-input combobox where the known
-  // options are dropdown suggestions instead of a closed Select gate. The old
-  // native <datalist> filtered by the current value, so a field already set
-  // to a valid option showed only that single suggestion.
-  if (selectOptions && FREE_INPUT_KEYS.has(schemaKey)) {
-    return row(
-      <ComboboxInput
-        className={CONTROL_TEXT}
-        onChange={onChange}
-        optionLabels={optionLabels}
-        options={selectOptions.filter(o => o !== '')}
-        placeholder={c.notSet}
-        value={String(value ?? '')}
-      />
-    )
-  }
-
-  if (selectOptions) {
-    return row(
-      <Select
-        onValueChange={next => onChange(next === EMPTY_SELECT_VALUE ? '' : next)}
-        value={String(value ?? '') || EMPTY_SELECT_VALUE}
-      >
-        <SelectTrigger className={CONTROL_TEXT}>
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          {selectOptions.map(option => (
-            <SelectItem key={option || EMPTY_SELECT_VALUE} value={option || EMPTY_SELECT_VALUE}>
-              {option
-                ? (optionLabels?.[option] ?? prettyName(option))
-                : schemaKey === 'display.personality'
-                  ? c.none
-                  : schemaKey === 'memory.provider'
-                    ? c.builtinOnly
-                    : c.noneParen}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-    )
+  if (selectField) {
+    return selectField
   }
 
   if (schema.type === 'number') {
@@ -207,7 +164,14 @@ export function ConfigField({
   }
 
   if (schema.type === 'list') {
-    return row(<ListField onChange={onChange} placeholder={c.commaSeparated} value={value} />)
+    return row(
+      <ListField
+        disabled={disabled}
+        onChange={onChange}
+        placeholder={placeholder ?? c.commaSeparated}
+        value={value}
+      />
+    )
   }
 
   if (typeof value === 'object' && value !== null) {
@@ -252,11 +216,13 @@ export function ConfigField({
 function ListField({
   value,
   onChange,
-  placeholder
+  placeholder,
+  disabled
 }: {
   value: unknown
   onChange: (value: unknown) => void
   placeholder: string
+  disabled: boolean
 }) {
   const normalizedValue = Array.isArray(value) ? value.join(', ') : String(value ?? '')
   const [draft, setDraft] = useState(normalizedValue)
@@ -277,6 +243,7 @@ function ListField({
   return (
     <Input
       className={CONTROL_TEXT}
+      disabled={disabled}
       onBlur={() => {
         focusedRef.current = false
         commitDraft()

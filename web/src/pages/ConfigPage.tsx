@@ -8,7 +8,6 @@ import {
   Upload,
   X,
   Settings2,
-  FileText,
   Settings,
   Bot,
   Monitor,
@@ -25,7 +24,6 @@ import {
   MessageCircle,
   Wrench,
   FileQuestion,
-  Filter,
   Cloud,
   Sparkles,
   LayoutDashboard,
@@ -38,20 +36,23 @@ import {
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { getNestedValue, setNestedValue } from "@/lib/nested";
+import { useRawConfigSource } from "@/lib/use-raw-config-source";
+import { useConfigYamlSource } from "@/lib/use-config-yaml-source";
+import { buildExplicitConfigPatch } from "@/lib/config-write";
+import { createConfigPageActions } from "./config-page-actions";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { Toast } from "@nous-research/ui/ui/components/toast";
 import { AutoField } from "@/components/AutoField";
 import { Button } from "@nous-research/ui/ui/components/button";
-import { ListItem } from "@nous-research/ui/ui/components/list-item";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
-import { Card, CardContent, CardHeader, CardTitle } from "@nous-research/ui/ui/components/card";
 import { ConfirmDialog } from "@nous-research/ui/ui/components/confirm-dialog";
 import { Input } from "@nous-research/ui/ui/components/input";
-import { Badge } from "@nous-research/ui/ui/components/badge";
 import { useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
+import { useProfileScope } from "@/contexts/useProfileScope";
 import { PluginSlot } from "@/plugins";
 import { errorMessage } from "@/lib/api-error";
+import { ConfigPageBody } from "./config-page-body";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -103,7 +104,17 @@ function CategoryIcon({
 /* ------------------------------------------------------------------ */
 
 export default function ConfigPage() {
+  const { profile } = useProfileScope();
+  return <ConfigPageInner key={profile} profile={profile} />;
+}
+
+function ConfigPageInner({ profile }: { profile: string }) {
   const [config, setConfig] = useState<Record<string, unknown> | null>(null);
+  const { source: rawSource, status: rawSourceStatus, retry: retryRawConfigSource } = useRawConfigSource(profile);
+  const [rawConfigDraft, setRawConfigDraft] = useState<Record<string, unknown> | null>(null);
+  const rawConfig = rawConfigDraft ?? rawSource;
+  const [editedPaths, setEditedPaths] = useState<string[]>([]);
+  const [unsetPaths, setUnsetPaths] = useState<string[]>([]);
   const [schema, setSchema] = useState<Record<
     string,
     Record<string, unknown>
@@ -115,8 +126,7 @@ export default function ConfigPage() {
   const [saving, setSaving] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [yamlMode, setYamlMode] = useState(false);
-  const [yamlText, setYamlText] = useState("");
-  const [yamlLoading, setYamlLoading] = useState(false);
+  const { loading: yamlLoading, retry: retryYamlSource, setText: setYamlText, status: yamlStatus, text: yamlText } = useConfigYamlSource(profile, yamlMode);
   const [yamlSaving, setYamlSaving] = useState(false);
   const [configPath, setConfigPath] = useState<string | null>(null);
   const [activeCategory, setActiveCategory] = useState<string>("");
@@ -163,13 +173,17 @@ export default function ConfigPage() {
   }
 
   useEffect(() => {
+    let cancelled = false;
     api
-      .getConfig()
-      .then(setConfig)
+      .getConfig(profile || undefined)
+      .then((next) => {
+        if (!cancelled) setConfig(next);
+      })
       .catch(() => {});
     api
-      .getSchema()
+      .getSchema(profile || undefined)
       .then((resp) => {
+        if (cancelled) return;
         // memory.provider has a dedicated management UI on the Plugins page
         // (provider cards + guided setup/switch flow). Hide it from the
         // generic config form so the two surfaces don't fight; the schema
@@ -192,16 +206,21 @@ export default function ConfigPage() {
     // config_path is machine-global (the dashboard's own profile) — wrong
     // header under the global profile switcher, so it's only a fallback.
     api
-      .getConfigRaw()
+      .getConfigRaw(profile || undefined)
       .then((resp) => {
-        if (resp.path) setConfigPath(resp.path);
+        if (!cancelled && resp.path) setConfigPath(resp.path);
       })
       .catch(() => {});
     api
       .getStatus()
-      .then((resp) => setConfigPath((prev) => prev ?? resp.config_path))
+      .then((resp) => {
+        if (!cancelled) setConfigPath((prev) => prev ?? resp.config_path);
+      })
       .catch(() => {});
-  }, []);
+    return () => {
+      cancelled = true;
+    };
+  }, [profile]);
 
   // Set active category when categories load
   useEffect(() => {
@@ -209,18 +228,6 @@ export default function ConfigPage() {
       setActiveCategory(categoryOrder[0]);
     }
   }, [categoryOrder, activeCategory]);
-
-  // Load YAML when switching to YAML mode
-  useEffect(() => {
-    if (yamlMode) {
-      setYamlLoading(true);
-      api
-        .getConfigRaw()
-        .then((resp) => setYamlText(resp.yaml))
-        .catch(() => showToast(t.config.failedToLoadRaw, "error"))
-        .finally(() => setYamlLoading(false));
-    }
-  }, [yamlMode]);
 
   /* ---- Categories ---- */
   const categories = useMemo(() => {
@@ -277,11 +284,23 @@ export default function ConfigPage() {
   }, [schema, activeCategory, isSearching]);
 
   /* ---- Handlers ---- */
+  const hasRawSourceDependentEdits = editedPaths.some((path) => schema?.[path]?.plugin_default);
+  const retryRawSource = () => {
+    setRawConfigDraft(null);
+    retryRawConfigSource();
+  };
+
   const handleSave = async () => {
-    if (!config) return;
+    if (!config || (hasRawSourceDependentEdits && rawSourceStatus !== "ready")) return;
     setSaving(true);
     try {
-      await api.saveConfig(config);
+      const patch = buildExplicitConfigPatch(config, editedPaths);
+      await api.saveConfig(patch, profile || undefined, unsetPaths);
+      retryRawSource();
+      const effective = await api.getConfig(profile || undefined);
+      setConfig(effective);
+      setEditedPaths([]);
+      setUnsetPaths([]);
       showToast(t.config.configSaved, "success");
     } catch (e) {
       showToast(`${t.config.failedToSave}: ${errorMessage(e)}`, "error");
@@ -291,14 +310,15 @@ export default function ConfigPage() {
   };
 
   const handleYamlSave = async () => {
+    if (yamlStatus !== "ready" || yamlLoading) return;
     setYamlSaving(true);
     try {
-      await api.saveConfigRaw(yamlText);
+      await api.saveConfigRaw(yamlText, profile || undefined);
       showToast(t.config.yamlConfigSaved, "success");
-      api
-        .getConfig()
-        .then(setConfig)
-        .catch(() => {});
+      api.getConfig(profile || undefined).then(setConfig).catch(() => {});
+      retryRawSource();
+      setEditedPaths([]);
+      setUnsetPaths([]);
     } catch (e) {
       showToast(`${t.config.failedToSaveYaml}: ${errorMessage(e)}`, "error");
     } finally {
@@ -306,66 +326,28 @@ export default function ConfigPage() {
     }
   };
 
-  const handleReset = () => {
-    if (!defaults || !config) return;
-    // Scope the reset to what the user is currently looking at:
-    //   - search mode → the matched fields
-    //   - form mode   → the active category's fields
-    // Resetting the whole config here was a footgun (issue reported by @ykmfb001):
-    // the button sits next to the category tabs and users reasonably assumed
-    // "reset this tab", not "wipe my entire config.yaml".
-    const scopedFields = isSearching ? searchMatchedFields : activeFields;
-    if (scopedFields.length === 0) return;
-    setConfirmReset(true);
-  };
-
-  const executeReset = () => {
-    if (!defaults || !config) return;
-    setConfirmReset(false);
-    const scopedFields = isSearching ? searchMatchedFields : activeFields;
-    if (scopedFields.length === 0) return;
-    const scopeLabel = isSearching
-      ? t.config.searchResults
-      : prettyCategoryName(activeCategory);
-    let next: Record<string, unknown> = config;
-    for (const [key] of scopedFields) {
-      next = setNestedValue(next, key, getNestedValue(defaults, key));
-    }
-    setConfig(next);
-    showToast(
-      t.config.resetScopeToast.replace("{scope}", scopeLabel),
-      "success",
-    );
-  };
-
-  const handleExport = () => {
-    if (!config) return;
-    const blob = new Blob([JSON.stringify(config, null, 2)], {
-      type: "application/json",
-    });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "hermes-config.json";
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const handleImport = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const imported = JSON.parse(reader.result as string);
-        setConfig(imported);
-        showToast(t.config.configImported, "success");
-      } catch {
-        showToast(t.config.invalidJson, "error");
-      }
-    };
-    reader.readAsText(file);
-  };
+  const { executeReset, handleExport, handleImport, handleReset } = createConfigPageActions({
+    activeCategory,
+    activeFields,
+    config,
+    configImported: t.config.configImported,
+    defaults,
+    invalidJson: t.config.invalidJson,
+    isSearching,
+    prettyCategoryName,
+    rawConfig,
+    rawSourceReady: rawSourceStatus === "ready",
+    resetScopeToast: t.config.resetScopeToast,
+    schema,
+    searchMatchedFields,
+    searchResults: t.config.searchResults,
+    setConfig,
+    setConfirmReset,
+    setEditedPaths,
+    setRawConfig: setRawConfigDraft,
+    setUnsetPaths,
+    showToast,
+  });
 
   /* ---- Loading ---- */
   if (!config || !schema) {
@@ -422,8 +404,25 @@ export default function ConfigPage() {
             <AutoField
               schemaKey={key}
               schema={s}
-              value={getNestedValue(config, key)}
-              onChange={(v) => setConfig(setNestedValue(config, key, v))}
+              value={s.plugin_default
+                ? rawConfig ? getNestedValue(rawConfig, key) : undefined
+                : getNestedValue(config, key)}
+              disabled={Boolean(s.plugin_default && rawSourceStatus !== "ready")}
+              placeholder={s.plugin_default && rawSourceStatus !== "ready"
+                ? rawSourceStatus === "loading" ? t.common.loading : t.config.failedToLoadRaw
+                : undefined}
+              onChange={(v) => {
+                if (s.plugin_default && rawSourceStatus !== "ready") return;
+                setConfig(setNestedValue(config, key, v));
+                if (s.plugin_default) {
+                  setRawConfigDraft((previous) => {
+                    const source = previous ?? rawConfig;
+                    return source ? setNestedValue(source, key, v) : previous;
+                  });
+                }
+                setEditedPaths((previous) => previous.includes(key) ? previous : [...previous, key]);
+                setUnsetPaths((previous) => previous.filter((path) => path !== key));
+              }}
             />
           </div>
         </div>
@@ -435,6 +434,12 @@ export default function ConfigPage() {
     <div className="flex flex-col gap-4">
       <PluginSlot name="config:top" />
       <Toast toast={toast} />
+      {rawSourceStatus === "error" && (
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-destructive/40 bg-destructive/5 p-3" role="alert">
+          <span className="text-sm">{t.config.failedToLoadRaw}</span>
+          <Button ghost size="sm" onClick={retryRawSource}>{t.common.refresh}</Button>
+        </div>
+      )}
 
       <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
         <div className="flex min-w-0 items-center gap-2 sm:flex-1">
@@ -448,6 +453,7 @@ export default function ConfigPage() {
             ghost
             size="icon"
             onClick={handleExport}
+            disabled={rawSourceStatus !== "ready"}
             title={t.config.exportConfig}
             aria-label={t.config.exportConfig}
           >
@@ -457,6 +463,7 @@ export default function ConfigPage() {
             ghost
             size="icon"
             onClick={() => fileInputRef.current?.click()}
+            disabled={rawSourceStatus !== "ready"}
             title={t.config.importConfig}
             aria-label={t.config.importConfig}
           >
@@ -467,6 +474,7 @@ export default function ConfigPage() {
             type="file"
             accept=".json"
             className="hidden"
+            disabled={rawSourceStatus !== "ready"}
             onChange={handleImport}
           />
           {!yamlMode &&
@@ -483,6 +491,7 @@ export default function ConfigPage() {
                   ghost
                   size="icon"
                   onClick={handleReset}
+                  disabled={rawSourceStatus !== "ready"}
                   title={resetTitle}
                   aria-label={resetTitle}
                 >
@@ -507,7 +516,7 @@ export default function ConfigPage() {
               size="sm"
               className="uppercase"
               onClick={handleYamlSave}
-              disabled={yamlSaving}
+              disabled={yamlSaving || yamlStatus !== "ready" || yamlLoading}
             >
               {yamlSaving ? t.common.saving : t.common.save}
             </Button>
@@ -516,7 +525,7 @@ export default function ConfigPage() {
               size="sm"
               className="uppercase"
               onClick={handleSave}
-              disabled={saving}
+              disabled={saving || (hasRawSourceDependentEdits && rawSourceStatus !== "ready")}
             >
               {saving ? t.common.saving : t.common.save}
             </Button>
@@ -524,140 +533,28 @@ export default function ConfigPage() {
         </div>
       </div>
 
-      {yamlMode ? (
-        <Card>
-          <CardHeader className="py-3 px-4">
-            <CardTitle className="text-sm flex items-center gap-2">
-              <FileText className="h-4 w-4" />
-              {t.config.rawYaml}
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="p-0">
-            {yamlLoading ? (
-              <div className="flex items-center justify-center py-12">
-                <Spinner className="text-xl text-primary" />
-              </div>
-            ) : (
-              <textarea
-                className="flex min-h-[600px] w-full bg-transparent px-4 py-3 text-sm font-mono leading-relaxed placeholder:text-muted-foreground focus-visible:outline-none border-t border-border"
-                value={yamlText}
-                onChange={(e) => setYamlText(e.target.value)}
-                spellCheck={false}
-              />
-            )}
-          </CardContent>
-        </Card>
-      ) : (
-        <div className="flex flex-col sm:flex-row gap-4">
-          <aside aria-label={t.config.filters} className="sm:w-56 sm:shrink-0">
-            <div className="sm:sticky sm:top-4">
-              <div className="flex flex-col border border-border bg-muted/20">
-                <div className="hidden sm:flex items-center gap-2 px-3 py-2 border-b border-border">
-                  <Filter className="h-3 w-3 text-text-tertiary" />
-                  <span className="font-mondwest text-display text-xs tracking-[0.12em] text-text-secondary">
-                    {t.config.filters}
-                  </span>
-                </div>
-
-                <div className="hidden sm:block px-3 pt-2 pb-1 font-mondwest text-display text-xs tracking-[0.12em] text-text-tertiary">
-                  {t.config.sections}
-                </div>
-
-                <div className="flex sm:flex-col gap-1 sm:gap-px p-2 sm:pt-1 overflow-x-auto sm:overflow-x-visible scrollbar-none sm:max-h-[calc(100vh-260px)] sm:overflow-y-auto">
-                  {categories.map((cat) => {
-                    const isActive = !isSearching && activeCategory === cat;
-
-                    return (
-                      <ListItem
-                        key={cat}
-                        active={isActive}
-                        onClick={() => {
-                          setSearchQuery("");
-                          setActiveCategory(cat);
-                        }}
-                        className="rounded-none whitespace-nowrap px-2 py-1 text-xs"
-                      >
-                        <CategoryIcon
-                          category={cat}
-                          className="h-3.5 w-3.5 shrink-0"
-                        />
-                        <span className="flex-1 truncate">
-                          {prettyCategoryName(cat)}
-                        </span>
-                        <span
-                          className={`text-xs tabular-nums ${
-                            isActive
-                              ? "text-text-secondary"
-                              : "text-text-tertiary"
-                          }`}
-                        >
-                          {categoryCounts[cat] || 0}
-                        </span>
-                      </ListItem>
-                    );
-                  })}
-                </div>
-              </div>
-            </div>
-          </aside>
-
-          <div className="flex-1 min-w-0">
-            {isSearching ? (
-              <Card>
-                <CardHeader className="py-3 px-4">
-                  <div className="flex items-center justify-between">
-                    <CardTitle className="text-sm flex items-center gap-2">
-                      <Search className="h-4 w-4" />
-                      {t.config.searchResults}
-                    </CardTitle>
-                    <Badge tone="secondary" className="text-xs">
-                      {searchMatchedFields.length}{" "}
-                      {t.config.fields.replace(
-                        "{s}",
-                        searchMatchedFields.length !== 1 ? "s" : "",
-                      )}
-                    </Badge>
-                  </div>
-                </CardHeader>
-                <CardContent className="grid gap-2 px-4 pb-4">
-                  {searchMatchedFields.length === 0 ? (
-                    <p className="text-sm text-muted-foreground text-center py-8">
-                      {t.config.noFieldsMatch.replace("{query}", searchQuery)}
-                    </p>
-                  ) : (
-                    renderFields(searchMatchedFields, true)
-                  )}
-                </CardContent>
-              </Card>
-            ) : (
-              /* Active category */
-              <Card>
-                <CardHeader className="py-3 px-4">
-                  <div className="flex items-center justify-between">
-                    <CardTitle className="text-sm flex items-center gap-2">
-                      <CategoryIcon
-                        category={activeCategory}
-                        className="h-4 w-4"
-                      />
-                      {prettyCategoryName(activeCategory)}
-                    </CardTitle>
-                    <Badge tone="secondary" className="text-xs">
-                      {activeFields.length}{" "}
-                      {t.config.fields.replace(
-                        "{s}",
-                        activeFields.length !== 1 ? "s" : "",
-                      )}
-                    </Badge>
-                  </div>
-                </CardHeader>
-                <CardContent className="grid gap-2 px-4 pb-4">
-                  {renderFields(activeFields)}
-                </CardContent>
-              </Card>
-            )}
-          </div>
-        </div>
-      )}
+      <ConfigPageBody
+        CategoryIcon={CategoryIcon}
+        activeCategory={activeCategory}
+        activeFields={activeFields}
+        categories={categories}
+        categoryCounts={categoryCounts}
+        isSearching={isSearching}
+        onRetryYamlSource={retryYamlSource}
+        onSelectCategory={(category) => {
+          setSearchQuery("");
+          setActiveCategory(category);
+        }}
+        onYamlChange={setYamlText}
+        prettyCategoryName={prettyCategoryName}
+        renderFields={renderFields}
+        searchMatchedFields={searchMatchedFields}
+        searchQuery={searchQuery}
+        yamlLoading={yamlLoading}
+        yamlMode={yamlMode}
+        yamlStatus={yamlStatus}
+        yamlText={yamlText}
+      />
       <PluginSlot name="config:bottom" />
       <ConfirmDialog
         open={confirmReset}

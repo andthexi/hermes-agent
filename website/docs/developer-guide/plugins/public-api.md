@@ -29,12 +29,14 @@ with a name allows that one name only.
 | `agent.delegation_provider` | whole module | developer-guide / plugins docs |
 | `hermes_cli.auth_model_picker` | `prompt_model_selection` | developer-guide / plugins docs |
 | `hermes_cli.auth` | `resolve_external_process_provider_credentials` | developer-guide / plugins docs |
+| `hermes_cli.config_plugin_defaults` | `CONFIG_DEFAULTS_VERSION` | developer-guide / plugins docs |
 | `hermes_cli.model_setup` | whole module | developer-guide / plugins docs |
 | `agent.image_gen_provider` | whole module | developer-guide / plugins docs |
 | `agent.memory_manager` | whole module | developer-guide / plugins docs |
 | `agent.memory_provider` | whole module | developer-guide / plugins docs |
 | `agent.secret_scope` | whole module | developer-guide / plugins docs |
 | `agent.secret_sources.base` | whole module | developer-guide / plugins docs |
+| `agent.secret_sources.registry` | `get_source` | developer-guide / plugins docs |
 | `agent.subagent_lifecycle` | whole module | developer-guide / plugins docs |
 | `agent.terminal_env_provider` | whole module | developer-guide / plugins docs |
 | `agent.transports` | whole module | developer-guide / plugins docs |

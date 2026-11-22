@@ -929,7 +929,7 @@ class TestConfigSupportFloor:
     _V12_EXPECTED = {
         "_config_version": 33,
         # agent.verify_on_stop stays materialised here: the fixture's on-disk
-        # config explicitly set it (True), so _explicit_config_paths preserves
+        # config explicitly set it (True), so explicit_config_paths preserves
         # the key through the v32 flip even though False now equals the
         # schema default.
         "agent": {"verify_on_stop": False},

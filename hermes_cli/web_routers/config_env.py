@@ -18,8 +18,9 @@ from hermes_cli.web_routers._common import (
 from hermes_cli.config_backend import refusing_locked_omissions
 from hermes_cli.web_deps import LateState, late
 from hermes_cli.web_server_config import (
-    _apply_main_model_assignment, _denormalize_config_from_web, drop_model_key, _normalize_config_for_web, _schema_with_dynamic_provider_options,
-    _validated_main_model_selection,
+    _apply_main_model_assignment, _denormalize_config_from_web, drop_model_key, _normalize_config_for_web,
+    _schema_with_dynamic_provider_options, _validated_main_model_selection, explicit_config_paths,
+    explicit_config_patch_from_web, merge_explicit_config_patch,
 )
 from hermes_cli.web_server_profiles import (
     _approval_mode_of, _broadcast_gateway_session_info, _is_other_profile, _parse_model_entries,
@@ -78,17 +79,59 @@ def _env_write_errors(log_msg: str):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+def _read_raw_source_config() -> dict[str, Any]:
+    """Strict exact-source read for raw editors; no defaults, plugin discovery, or write-side recovery."""
+    from hermes_cli.config import get_config_path
+    from hermes_cli.config_backend import read_config_doc_readonly
+
+    try:
+        source = read_config_doc_readonly(get_config_path())
+    except FileNotFoundError:
+        return {}
+    if source is None:
+        return {}
+    if not isinstance(source, dict):
+        raise ValueError("raw config root is not a mapping")
+    return source
+
+
 @config_router.get("/api/config")
-async def get_config(profile: Optional[str] = None, include_defaults: bool = True):
-    # _profile_scope blocks on the process-wide _SKILLS_PROFILE_LOCK and
-    # load_config() reads from disk; a slow lock-holder on the event loop froze
-    # the whole gateway for >1s. asyncio.to_thread copies the contextvar
-    # context, so the profile override stays scoped to the worker thread.
-    # Opt in to saved values so clients can distinguish user choices from defaults.
-    config = await scoped_to_thread(
-        profile, lambda: _normalize_config_for_web(load_config() if include_defaults else read_raw_config())
-    )
-    # Strip internal keys that the frontend shouldn't see or send back
+async def get_config(
+    profile: Optional[str] = None, include_defaults: bool = True, raw_source: bool = False,
+):
+    # The legacy include_defaults=false view remains web-normalized; raw_source is the exact source
+    # document for write-intent editors and exports, with read failures kept distinct from empty config.
+    if raw_source:
+        from hermes_cli.config_backend import ConfigBackendUnavailable
+        import hermes_yaml as yaml
+        try:
+            config = await scoped_to_thread(profile, _read_raw_source_config)
+        except ConfigBackendUnavailable:
+            raise HTTPException(
+                status_code=503,
+                detail="Raw configuration source is unavailable; retry when the configured backend recovers.",
+            ) from None
+        except PermissionError:
+            raise HTTPException(
+                status_code=403,
+                detail="Raw configuration source is not readable; check file permissions and retry.",
+            ) from None
+        except (OSError, TypeError, ValueError, yaml.YAMLError):
+            raise HTTPException(
+                status_code=422,
+                detail="Raw configuration source is malformed or is not a mapping; repair config.yaml and retry.",
+            ) from None
+    else:
+        try:
+            config = await scoped_to_thread(
+                profile,
+                lambda: _normalize_config_for_web(load_config() if include_defaults else read_raw_config()),
+            )
+        except Exception as exc:
+            from hermes_cli.config_plugin_defaults import PluginDefaultsError
+            if isinstance(exc, PluginDefaultsError):
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise
     return {k: v for k, v in config.items() if not k.startswith("_")}
 
 
@@ -107,6 +150,36 @@ async def get_schema(profile: Optional[str] = None):
     # /api/ws — for as long as the scan took. asyncio.to_thread copies the
     # contextvar context, so the profile override stays scoped to the worker.
     fields = await config_scoped_to_thread(profile, _schema_with_dynamic_provider_options)
+
+    def _default_merge_modes():
+        from hermes_cli import managed_scope
+        from hermes_cli.config_plugin_defaults import resolve_default_merge_modes, _escaped_path
+        from hermes_cli.plugins_config_defaults import collect_config_default_layers
+        from hermes_constants import get_hermes_home
+        raw = read_raw_config()
+        layers, _signature = collect_config_default_layers(
+            get_hermes_home(), raw, managed_scope.load_managed_config() or {})
+        modes = resolve_default_merge_modes(layers)
+        # `_schema_with_dynamic_provider_options` may return the shared CONFIG_SCHEMA object on a
+        # profile without dynamic choices; merge metadata belongs to this request/profile only.
+        scoped_fields = {key: dict(spec) for key, spec in fields.items()}
+        for path, (_owner, mode, is_list) in modes.items():
+            field_path = _escaped_path(path)
+            if is_list and field_path in scoped_fields:
+                scoped_fields[field_path]["plugin_default"] = True
+                scoped_fields[field_path]["merge_mode"] = mode
+                scoped_fields[field_path]["merge_description"] = (
+                    "Plugin-provided entries remain active; this list edits only your profile entries."
+                )
+        return scoped_fields
+
+    try:
+        fields = await config_scoped_to_thread(profile, _default_merge_modes)
+    except Exception as exc:
+        from hermes_cli.config_plugin_defaults import PluginDefaultsError
+        if isinstance(exc, PluginDefaultsError):
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise
     return {"fields": fields, "category_order": _CATEGORY_ORDER}
 
 
@@ -131,24 +204,47 @@ async def update_config(
             # in the PUT body, so deep-merge incoming over disk rather than
             # full-replace — the frontend can only overwrite what it sends.
             with _CONFIG_MUTATION_LOCK:
-                # Strict read: the merge below builds a new dict, so a swallowed read error here
-                # would save the PUT body alone over the whole file.
                 existing = require_readable_config_before_write()
-                incoming = _denormalize_config_from_web(body.config)
-                merged = _deep_merge(existing, incoming)
-                # Compare normalized approvals.mode across the in-memory
-                # documents, not config blocks and not cache re-reads: the page
-                # PUTs the defaulted GET record while disk holds sparse YAML (a
-                # block compare is always-unequal), and a post-save reload can
-                # serve the pre-save cache on an (mtime_ns, size) collision.
-                # Only approvals.mode feeds session.info, so it is the trigger.
+                from hermes_cli import managed_scope
+                from hermes_cli.config_plugin_defaults import PluginDefaultsError
+                from hermes_cli.plugins_config_defaults import collect_config_default_layers
+                from hermes_constants import get_hermes_home
+
+                managed_bootstrap = managed_scope.load_managed_config() or {}
+                try:
+                    active_defaults, _signature = collect_config_default_layers(
+                        get_hermes_home(), existing, managed_bootstrap)
+                except PluginDefaultsError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+                preserve: set[tuple[str, ...]] = set()
+                if body.write_mode == "explicit_patch":
+                    incoming, model_unsets = explicit_config_patch_from_web(body.config)
+                    merged = merge_explicit_config_patch(existing, incoming)
+                    from hermes_cli.config import _unset_nested
+                    unset_paths = set(body.unset_paths) | model_unsets
+                    for path in unset_paths:
+                        _unset_nested(merged, path)
+                    try:
+                        collect_config_default_layers(get_hermes_home(), merged, managed_bootstrap)
+                    except PluginDefaultsError as exc:
+                        raise HTTPException(status_code=422, detail=str(exc)) from exc
+                    preserve = explicit_config_paths(incoming)
+                else:
+                    if active_defaults:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=("This profile has enabled plugin config defaults. Refusing an ambiguous full-document "
+                                    "write; send write_mode='explicit_patch' with only intentional raw edits, or edit "
+                                    "the raw config source."),
+                        )
+                    incoming = _denormalize_config_from_web(body.config)
+                    merged = _deep_merge(existing, incoming)
+
                 approvals_mode_changed = _approval_mode_of(merged) != _approval_mode_of(existing)
-                # Explicit English must survive default stripping: an absent
-                # language lets the desktop follow the OS on its next launch.
-                # Ordinary settings saves include merged defaults, not a choice.
-                save_config(
-                    merged, preserve_keys={("display", "language")} if preserve_language else None
-                )
+                if preserve_language:
+                    preserve.add(("display", "language"))
+                save_config(merged, preserve_keys=preserve or None)
         # REST saves bypass the config.set RPC (which re-emits itself), so
         # refresh live sessions' cached approval/YOLO indicators after a mode
         # change. Own-profile saves only: a profile-scoped save targets a

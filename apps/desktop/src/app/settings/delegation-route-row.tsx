@@ -36,7 +36,7 @@ export function DelegationRouteRow({
 }: {
   config: HermesConfigRecord
   scope?: ProfileScope
-  onConfigChange: (next: HermesConfigRecord) => void
+  onConfigChange: (next: HermesConfigRecord, paths: string[]) => void
 }) {
   const { t } = useI18n()
 
@@ -50,7 +50,14 @@ export function DelegationRouteRow({
         baseUrl={String(getNested(config, 'delegation.base_url') ?? '')}
         model={String(getNested(config, 'delegation.model') ?? '')}
         modelDescription={description}
-        onChange={route => onConfigChange(applyDelegationRoute(config, route))}
+        onChange={route => onConfigChange(
+          applyDelegationRoute(config, route),
+          [
+            'delegation.model',
+            'delegation.provider',
+            ...(route.resetDirectEndpoint ? DIRECT_ENDPOINT_KEYS : [])
+          ]
+        )}
         provider={String(getNested(config, 'delegation.provider') ?? '')}
         scope={scope}
       />

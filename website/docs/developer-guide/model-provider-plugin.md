@@ -72,6 +72,10 @@ description: Acme Inference — OpenAI-compatible direct API
 author: Your Name
 ```
 
+A manifest may also declare generic `config_defaults` when Hermes advertises the manifest-defaults capability. They are data-only, profile-opt-in via `plugins.enabled`, and compose as a read-time layer beneath explicit user config; they do not replace provider registration. See [Manifest config defaults](./plugins/index.md#manifest-config-defaults) for first-wins, null/list, raw-write and compatibility rules.
+
+Provider profiles keep their own precedence: user provider registrations are still last-writer-wins over bundled profiles. That is intentionally distinct from first-contributor-wins config-default precedence.
+
 That's it. After dropping these two files, the following **auto-wire** with no other edits:
 
 | Integration | Where | What it gets |
@@ -79,7 +83,7 @@ That's it. After dropping these two files, the following **auto-wire** with no o
 | Credential resolution | `hermes_cli/auth.py` | `PROVIDER_REGISTRY["acme-inference"]` populated from profile |
 | `--provider` CLI flag | `hermes_cli/main.py` | Accepts `acme-inference` |
 | `/model --provider`, model picker switch | `hermes_cli/providers.py::resolve_provider_full` | Resolves `acme-inference` and every alias to the profile (switch lands on `name`, so `acme` persists as `acme-inference`); user `providers:` / `custom_providers:` blocks keep precedence. A profile with an empty `base_url` (endpoint minted at runtime) resolves too, on the last rung |
-| `hermes model` picker | `hermes_cli/models.py` | Appears in `CANONICAL_PROVIDERS`, model list fetched from `{base_url}/models` |
+| `hermes model` picker | `hermes_cli/models.py` | Appears in `CANONICAL_PROVIDERS`; uses the provider's live catalog when enabled, else its static/fallback catalog |
 | `hermes doctor` | `hermes_cli/doctor.py` | Health check for `ACME_API_KEY` + `{base_url}/models` probe |
 | `hermes setup` | `hermes_cli/config.py` | `ACME_API_KEY` appears in `OPTIONAL_ENV_VARS` and the setup wizard |
 | URL reverse-mapping | `agent/model_metadata.py` | Hostname → provider name for auto-detection |

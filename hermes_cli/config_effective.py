@@ -50,20 +50,14 @@ def _recover_user_raw(config_path: Path, path_key: str, exc: Exception) -> dict[
 
 
 def load_user_config_effective(config_path: Optional[Path] = None, *, fail_closed: bool = False) -> dict[str, Any]:
-    """User ``config.yaml`` → ``${VAR}`` expansion → managed overlay → model-key canonicalization.
-    NO ``DEFAULT_CONFIG`` merge: a key absent from the file (and from the managed layer) is absent
-    here, so ``{}`` sentinels and presence-sensitive bridges keep working. An absent file is an
-    empty user layer (the managed layer still applies). Returns a fresh deepcopy.
+    """Raw user settings plus enabled plugin defaults and managed policy, without built-in defaults.
 
-    Broken YAML: ``fail_closed=True`` raises the parse error (for callers that keep their own
-    last-good state); otherwise the last successfully parsed user file — in-process first, then
-    the newest ``backups/config/*.good.*`` copy — is served through the same pipeline, so a
-    mid-edit torn write never silently drops user overrides (same contract as ``load_config``).
-    Cached on the user + managed file signatures and the values of every referenced env var."""
+    Plugin values are composed beneath explicitly present user values, then environment-expanded and
+    overlaid by managed policy. Raw recovery and write-back remain file-only. A frozen worker uses its
+    owner-provided snapshot and performs no manifest discovery.
+    """
     from agent.safe_worker_policy import worker_config_snapshot
 
-    # A frozen-policy worker is detached from the profile's files: the owner-supplied
-    # snapshot IS the user layer (same seam load_config / read_raw_config honour).
     snapshot = worker_config_snapshot()
     if snapshot is not None:
         return _effective(snapshot)
@@ -71,18 +65,12 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
         config_path = _config.get_config_path()
     path_key = str(config_path)
     with _config._CONFIG_LOCK:
-        user_sig, cache_sig = _config._load_config_cache_sig(config_path)
-        cached = _EFFECTIVE_CACHE.get(path_key)
-        n = len(cache_sig) if cache_sig is not None else 0
-        if cached is not None and cache_sig is not None and cached[:n] == cache_sig:
-            if all(_config._env_ref_lookup(k) == v for k, v in cached[n + 1].items()):
-                return copy.deepcopy(cached[n])
-
+        user_sig, source_cache_sig = _config._load_config_cache_sig(config_path)
         raw: dict[str, Any] = {}
         recovered = False
         raw_hit = _config._raw_config_cache_hit(path_key, user_sig) if user_sig is not None else None
         if raw_hit is not None:
-            raw = copy.deepcopy(raw_hit)  # one parse per process, shared with read_raw_config()
+            raw = copy.deepcopy(raw_hit)
             _LAST_GOOD_USER_RAW.setdefault(path_key, copy.deepcopy(raw))
         elif user_sig is not None:
             try:
@@ -95,20 +83,28 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
                 raw = loaded if isinstance(loaded, dict) else {}
                 _config._raw_config_cache_store(path_key, user_sig, copy.deepcopy(raw))
                 _LAST_GOOD_USER_RAW[path_key] = copy.deepcopy(raw)
-                # Same copy load_config keeps: a fresh process recovers from it (see _recover_user_raw).
-                # Only for the ACTIVE home — a read of another profile's file (doctor, TUI cwd lookup)
-                # must not create backups/ inside that profile.
                 if config_path == _config.get_config_path():
                     from hermes_cli.config_backups import backup_config
                     backup_config(config_path, "good")
 
-        env_snapshot = _config._env_ref_snapshot(raw)
         managed = managed_scope.load_managed_config()
+        normalized = _config._normalize_root_model_keys(copy.deepcopy(raw))
+        from hermes_cli.config_plugin_defaults import compose_user_layer
+        from hermes_cli.plugins_config_defaults import collect_config_default_layers
+
+        layers, plugin_signature = collect_config_default_layers(config_path.parent, normalized, managed or {})
+        plugin_user = compose_user_layer(normalized, layers)
+        cache_sig = (*source_cache_sig, plugin_signature) if source_cache_sig is not None else None
+        cached = _EFFECTIVE_CACHE.get(path_key)
+        n = len(cache_sig) if cache_sig is not None else 0
+        if cached is not None and cache_sig is not None and cached[:n] == cache_sig:
+            if all(_config._env_ref_lookup(k) == v for k, v in cached[n + 1].items()):
+                return copy.deepcopy(cached[n])
+
+        env_snapshot = _config._env_ref_snapshot(plugin_user)
         if managed:
             _config._env_ref_snapshot(managed, env_snapshot)
-        effective = _effective(raw)
-        # A recovered result is never cached under the corrupt file's signature: a later
-        # ``fail_closed`` caller must still see the parse error, not a cache hit.
+        effective = _effective(plugin_user)
         if cache_sig is not None and not recovered:
             _EFFECTIVE_CACHE[path_key] = (*cache_sig, copy.deepcopy(effective), env_snapshot)
         else:

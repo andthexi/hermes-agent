@@ -395,15 +395,19 @@ def model_choice_save_count() -> int:
 def _save_model_choice(model_id: str) -> None:
     """Save the selected model to config.yaml only — NOT .env, which would stomp in multi-agent setups."""
     global _model_choice_saves
-    from hermes_cli.config import save_config, load_config
+    from hermes_cli.config import read_raw_config, save_config
     _model_choice_saves += 1
-    config = load_config()
-    # Always use dict format so provider/base_url can be stored alongside
-    if isinstance(config.get("model"), dict):
-        config["model"]["default"] = model_id
+    config = read_raw_config()
+    model_cfg = config.get("model")
+    if isinstance(model_cfg, dict):
+        model_cfg = dict(model_cfg)
+    elif isinstance(model_cfg, str) and model_cfg.strip():
+        model_cfg = {"default": model_cfg.strip()}
     else:
-        config["model"] = {"default": model_id}
-    save_config(config)
+        model_cfg = {}
+    model_cfg["default"] = model_id
+    config["model"] = model_cfg
+    save_config(config, preserve_keys={("model", "default")})
     from hermes_cli.observability.shared_metrics_setup import note_provider_setup_saved
 
     note_provider_setup_saved()

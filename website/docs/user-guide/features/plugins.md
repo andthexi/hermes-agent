@@ -100,6 +100,12 @@ The gateway does not load project-local plugins. Every Hermes session (`hermes`,
 
 To use a plugin, install it as a user plugin (`~/.hermes/plugins/` or `hermes plugins install`) and enable it with `hermes plugins enable <name>`.
 
+## Read-time config defaults
+
+A native manifest may provide ordinary, non-secret `config_defaults` without running plugin code during config bootstrap. These values fill only missing raw user paths; explicit values—including null, falsy values, and values equal to the plugin default—win. Lists replace by default. A list path may explicitly use `append_unique`: profile entries remain first, plugin entries follow in dependency/alphabetical order with stable deduplication; raw `[]` inherits and raw `null` blocks the list contribution. A null or non-mapping parent is never reconstructed to inject a descendant.
+
+Defaults are effective-read data and never written into `config.yaml`. Use the raw config view/editor to edit the user source. Full-document settings writes on profiles with active defaults require an explicit edit patch; ambiguous older full-document writes are refused rather than guessed. Reset/unset removes the raw override and reveals the current defaults. Malformed enabled declarations fail that profile's effective read with an actionable plugin/path error; raw recovery and sibling profiles remain available. Updating defaults affects new reads and new conversations; active conversations keep their cached prompt prefix. See [Manifest config defaults](../../developer-guide/plugins/index.md#manifest-config-defaults).
+
 ## What plugins can do
 
 Every `ctx.*` API below is available inside a plugin's `register(ctx)` function.
@@ -172,7 +178,7 @@ User plugins at `~/.hermes/plugins/model-providers/<name>/` override bundled mod
 
 ## Plugins are opt-in (with a few exceptions)
 
-**General plugins and user-installed backends are disabled by default** — discovery finds them (so they show up in `hermes plugins` and `/plugins`), but nothing with hooks or tools loads until you add the plugin's name to `plugins.enabled` in `~/.hermes/config.yaml`. This stops third-party code from running without your explicit consent.
+**General plugins and user-installed backends are disabled by default** — discovery finds them (so they show up in `hermes plugins` and `/plugins`), but nothing with hooks or tools loads until you add the plugin's name to `plugins.enabled` in `~/.hermes/config.yaml`. This stops third-party code from running without your explicit consent. Declarative `config_defaults` are also opt-in through `plugins.enabled` for every plugin kind, including model providers; `plugins.disabled` wins.
 
 :::note `plugins.enabled` governs plugins only
 [Gateway event hooks](./hooks.md#gateway-event-hooks) under `~/.hermes/hooks/<name>/` are not plugins and are **not** gated by `plugins.enabled` or `plugins.disabled`. That directory is trusted by placement: any subdirectory holding a valid `HOOK.yaml` + `handler.py` is imported by the gateway at startup, and placing the files there is the opt-in. See the [gateway hook trust model](./hooks.md#gateway-hook-trust).

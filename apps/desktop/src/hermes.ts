@@ -52,7 +52,6 @@ export type {
   ComputerUseCheck,
   ComputerUsePermissionSource,
   ComputerUseStatus,
-  ConfigFieldSchema,
   ConfigSchemaResponse,
   CronDeliveryTarget,
   CronJob,

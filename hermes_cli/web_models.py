@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field, SecretStr, StrictBool, StrictInt, field_v
 class ConfigUpdate(BaseModel):
     config: dict
     profile: Optional[str] = None
+    write_mode: Literal["explicit_patch"] | None = None
+    unset_paths: list[str] = Field(default_factory=list)
 
 class EnvVarUpdate(BaseModel):
     key: str

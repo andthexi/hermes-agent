@@ -251,8 +251,10 @@ def _load_raw_config() -> dict[str, Any]:
 
 
 def _skills_cfg() -> Optional[dict[str, Any]]:
-    """The ``skills:`` mapping from config.yaml, or None when absent/malformed."""
-    skills_cfg = _load_raw_config().get("skills")
+    """Effective ``skills:`` settings, including enabled manifest defaults and managed policy."""
+    from hermes_cli.config_effective import load_user_config_effective
+
+    skills_cfg = load_user_config_effective().get("skills")
     return skills_cfg if isinstance(skills_cfg, dict) else None
 
 
@@ -319,7 +321,7 @@ def _normalize_string_set(values) -> set[str]:
 
 # config identity -> resolved external dirs. Called once per skill during
 # banner / tool-registry scans; re-resolving each time dominated cold-start.
-_EXTERNAL_DIRS_CACHE: dict[tuple[str, int, int, int, int], list[Path]] = {}
+_EXTERNAL_DIRS_CACHE: dict[tuple[Any, ...], list[Path]] = {}
 
 
 def _external_dirs_cache_clear() -> None:
@@ -338,23 +340,18 @@ def _config_str_list(raw) -> list[str]:
 
 
 def get_external_skills_dirs() -> list[Path]:
-    """Validated, deduplicated ``skills.external_dirs`` (existing dirs only). Entries
-    are ``~``/``${VAR}`` expanded, relative to HERMES_HOME; the local skills dir is skipped."""
-    from hermes_cli.config_backend import config_exists
+    """Validated, deduplicated effective ``skills.external_dirs`` (existing dirs only)."""
     config_path = get_config_path()
-    if not config_exists(config_path):
-        return []
+    skills_cfg = _skills_cfg()
+    entries = skills_cfg.get("external_dirs") if skills_cfg is not None else None
     full_key = _config_cache_key(config_path)
-    cache_key = full_key
-    cached = _EXTERNAL_DIRS_CACHE.get(cache_key) if cache_key is not None else None
+    cache_key = (*full_key, repr(entries)) if full_key is not None else (str(config_path), repr(entries))
+    cached = _EXTERNAL_DIRS_CACHE.get(cache_key)
     if cached is not None:
         return list(cached)  # copy so callers can't mutate the cache
-    skills_cfg = _skills_cfg()
-    if skills_cfg is None:
-        return []
     local_skills = get_skills_dir().resolve()
     result: list[Path] = []
-    for entry in _config_str_list(skills_cfg.get("external_dirs")):
+    for entry in _config_str_list(entries):
         p = _home_relative(_expand_path(entry)).resolve()
         if p == local_skills or p in result:
             continue

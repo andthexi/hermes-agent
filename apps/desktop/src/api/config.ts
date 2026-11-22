@@ -156,10 +156,11 @@ async function fetchBoundConfigRecord(
 
 export function getHermesConfigRecord(
   profile?: ProfileScope,
-  { includeDefaults = true }: { includeDefaults?: boolean } = {}
+  { includeDefaults = true, rawSource = false }: { includeDefaults?: boolean; rawSource?: boolean } = {}
 ): Promise<HermesConfigRecord> {
   return fetchBoundConfigRecord(profile, {
-    path: includeDefaults ? '/api/config' : '/api/config?include_defaults=false'
+    path: rawSource ? '/api/config?raw_source=true' :
+      includeDefaults ? '/api/config' : '/api/config?include_defaults=false'
   })
 }
 
@@ -180,25 +181,29 @@ export function getHermesConfigSchema(profile?: null | string): Promise<ConfigSc
 export function saveHermesConfig(
   config: HermesConfigRecord,
   profile?: ProfileScope,
-  { preserveLanguage = false }: { preserveLanguage?: boolean } = {}
+  { preserveLanguage = false, unsetPaths = [] }: { preserveLanguage?: boolean; unsetPaths?: string[] } = {}
 ): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
     ...resolveConfigWriteScope(config, profile),
     path: preserveLanguage ? '/api/config?preserve_language=true' : '/api/config',
     method: 'PUT',
-    body: { config }
+    body: { config, write_mode: 'explicit_patch', unset_paths: unsetPaths }
   })
 }
 
 /** Capability-scoped counterpart of saveHermesConfig — writes the config of
  *  the profile/connection the Capabilities scope selector points at (possibly
  *  on another registered gateway), mirroring getHermesConfigRecord. */
-export function saveHermesConfigRecord(config: HermesConfigRecord, profile?: ProfileScope): Promise<{ ok: boolean }> {
+export function saveHermesConfigRecord(
+  config: HermesConfigRecord,
+  profile?: ProfileScope,
+  unsetPaths: string[] = []
+): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
     ...resolveConfigWriteScope(config, profile),
     path: '/api/config',
     method: 'PUT',
-    body: { config }
+    body: { config, write_mode: 'explicit_patch', unset_paths: unsetPaths }
   })
 }
 

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import codecs
+import hashlib
 import io
 import itertools
+import json
 import logging
 import os
 import sys
@@ -64,6 +66,8 @@ _SECRET_SOURCE_WRITES_BY_HOME: dict[str, dict[str, tuple[str, str, str | None]]]
 # several hot modules, so without this the Bitwarden status line prints 3-5x per startup and the config
 # re-parse + ASCII sweep re-run each time (Bitwarden's own cache only saves the network call).
 _APPLIED_HOMES: set[str] = set()
+_SECRET_SOURCE_CONFIG_SIGNATURES_BY_HOME: dict[str, str] = {}
+_SECRET_SOURCE_APPLIED_SIGNATURES_BY_HOME: dict[str, str] = {}
 _SECRET_SOURCE_CACHE_LOCK = threading.RLock()
 
 # What THIS process has published from dotenv files, per variable: (value before our first publish, or
@@ -193,18 +197,21 @@ def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
     if worker_config_snapshot() is not None:
         return {}
     home_key = str(home.resolve())
-    if home_key in _APPLIED_HOMES:
-        return get_secret_source_values(home)
-
-    # A retry must not keep serving a partial result after the source is removed, disabled, or can no
-    # longer be evaluated. Publish only the snapshot established by this attempt.
-    _SECRET_SOURCE_VALUES_BY_HOME.pop(home_key, None)
-    _SECRET_SOURCE_RESTORE_BY_HOME.pop(home_key, None)
-
+    from hermes_cli.config_plugin_defaults import PluginDefaultsError
     try:
         cfg = _load_secrets_config(home)
-    except Exception:
+    except PluginDefaultsError:
+        raise
+    except Exception:  # health: allow BLE001 -- startup is fail-open and parser diagnostics may expose secrets
         return {}
+    config_signature = _SECRET_SOURCE_CONFIG_SIGNATURES_BY_HOME.get(home_key, "")
+    if (home_key in _APPLIED_HOMES
+            and _SECRET_SOURCE_APPLIED_SIGNATURES_BY_HOME.get(home_key) == config_signature):
+        return get_secret_source_values(home)
+    _APPLIED_HOMES.discard(home_key)
+    # A changed source declaration must not keep serving the previous profile snapshot.
+    _SECRET_SOURCE_VALUES_BY_HOME.pop(home_key, None)
+    _SECRET_SOURCE_RESTORE_BY_HOME.pop(home_key, None)
     if not cfg:
         return {}
 
@@ -225,7 +232,7 @@ def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
         local_env["HERMES_HOME"] = str(home)
         env_before = dict(local_env)
         report = apply_all(cfg, home, environ=local_env)
-    except Exception:
+    except Exception:  # health: allow BLE001 -- source exceptions may contain credential material
         return {}
 
     if not report.sources:
@@ -244,6 +251,7 @@ def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
     # mixed report are still snapshotted below and can be used while the failed source recovers.
     if all(src.result.ok for src in report.sources):
         _APPLIED_HOMES.add(home_key)
+        _SECRET_SOURCE_APPLIED_SIGNATURES_BY_HOME[home_key] = config_signature
     # Same ownership bookkeeping as the process-global path: a name this profile's source supplied — applied,
     # or skipped because the private mapping already had it — is a source-owned name the routed-child scrub
     # must know about, or a sibling still inherits the launch value for it (review on f5f88d5058).
@@ -268,6 +276,8 @@ def reset_secret_source_cache(hermes_home: str | os.PathLike | None = None) -> N
     (#102041)."""
     if hermes_home is None:
         _APPLIED_HOMES.clear()
+        _SECRET_SOURCE_CONFIG_SIGNATURES_BY_HOME.clear()
+        _SECRET_SOURCE_APPLIED_SIGNATURES_BY_HOME.clear()
         _SECRET_SOURCES.clear()
         _SOURCE_SUPPLIED_NAMES.clear()
         _SECRET_SOURCE_VALUES_BY_HOME.clear()
@@ -276,6 +286,8 @@ def reset_secret_source_cache(hermes_home: str | os.PathLike | None = None) -> N
         return
     home_key = str(Path(hermes_home).resolve())
     _APPLIED_HOMES.discard(home_key)
+    _SECRET_SOURCE_CONFIG_SIGNATURES_BY_HOME.pop(home_key, None)
+    _SECRET_SOURCE_APPLIED_SIGNATURES_BY_HOME.pop(home_key, None)
     _SECRET_SOURCE_VALUES_BY_HOME.pop(home_key, None)
     _SECRET_SOURCE_RESTORE_BY_HOME.pop(home_key, None)
 
@@ -906,10 +918,42 @@ def _refuse_protected_env_from_sources(report, backend=None, environ_before=None
         f"from a secret source; remove the mapping. {outcome}")
 
 
-def _publish_staged_env(staged: dict, environ_before: dict) -> None:
-    """Copy into ``os.environ`` exactly the names the sources set in *staged* (value differs from
-    *environ_before*). Sources only ever set names, so nothing is removed; a name nobody's source
-    touched is left alone even if another thread changed it meanwhile."""
+def _stage_source_owned_values_for_refresh(
+    environ_before: dict[str, str], source_writes: dict[str, tuple[str, str, str | None]],
+    active_sources: set[str], dotenv_names: set[str],
+) -> tuple[dict[str, str], set[str], dict[str, tuple[str, str, str | None]]]:
+    """Rebase unchanged source-owned values to their pre-source state for a fresh apply pass."""
+    staged = dict(environ_before)
+    remove: set[str] = set()
+    rebased: dict[str, tuple[str, str, str | None]] = {}
+    for name, (source, value, prior) in source_writes.items():
+        if source not in active_sources or name in dotenv_names or environ_before.get(name) != value:
+            continue
+        if prior is None:
+            staged.pop(name, None)
+            remove.add(name)
+        else:
+            staged[name] = prior
+        rebased[name] = (source, value, prior)
+    return staged, remove, rebased
+
+
+def _restore_failed_source_values(
+    staged: dict[str, str], remove: set[str], rebased: dict[str, tuple[str, str, str | None]], report,
+) -> None:
+    """Keep a prior value when its active source failed this refresh, as other source caches do."""
+    failed = {source.name for source in report.sources if not source.result.ok}
+    for name, (source, value, _prior) in rebased.items():
+        if source in failed and name not in report.provenance:
+            staged[name] = value
+            remove.discard(name)
+
+
+def _publish_staged_env(staged: dict, environ_before: dict, *, remove: set[str]) -> None:
+    """Publish fetched values and CAS-remove only values previously written by a source."""
+    for name in remove:
+        if name not in staged and os.environ.get(name) == environ_before.get(name):
+            os.environ.pop(name, None)
     for name, value in staged.items():
         if environ_before.get(name) != value:
             os.environ[name] = value
@@ -921,21 +965,29 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     live in ``registry.apply_all``; this wrapper owns the once-per-home guard, the post-apply ASCII sweep,
     the ``_SECRET_SOURCES`` map and status lines."""
     home_key = str(Path(home_path).resolve())
-    if home_key in _APPLIED_HOMES:
-        return
-
-    # Neither early return marks the home applied: a malformed config.yaml would otherwise permanently
-    # disable secret loading for this process, and an unmarked home picks up a config change on the next
-    # load (the signature-cached read is cheap).
+    from hermes_cli.config_plugin_defaults import PluginDefaultsError
     try:
         cfg = _load_secrets_config(home_path)
+    except PluginDefaultsError as exc:
+        # Keep early dotenv/bootstrap alive so raw config and plugin-disable recovery remain available;
+        # the first effective config read reports the typed declaration error to its caller.
+        logger.error("Skipping secret-source bootstrap for %s: %s", home_path, exc)
+        return
     except Exception:
         # See #40597.
         return
+    config_signature = _SECRET_SOURCE_CONFIG_SIGNATURES_BY_HOME.get(home_key, "")
+    if (home_key in _APPLIED_HOMES
+            and _SECRET_SOURCE_APPLIED_SIGNATURES_BY_HOME.get(home_key) == config_signature):
+        return
+    _APPLIED_HOMES.discard(home_key)
     # No source configured / enabled any more: whatever one wrote earlier is no longer backed (#126982
     # review). A config READ failure above keeps them — fail-open, same as the fetch-failure path below.
     if not cfg:
         _revoke_secret_source_writes(home_path, keep=lambda _name, _source: False)
+        _SECRET_SOURCE_VALUES_BY_HOME.pop(home_key, None)
+        _SECRET_SOURCE_RESTORE_BY_HOME.pop(home_key, None)
+        _SECRET_SOURCE_APPLIED_SIGNATURES_BY_HOME[home_key] = config_signature
         return
 
     # Defer the registry import until a source is enabled — bitwarden eagerly loads cryptography._rust.pyd,
@@ -965,10 +1017,13 @@ def _apply_external_secret_sources(home_path: Path) -> None:
 
     backend_before = get_config_backend()
 
-    # The sources write into a private staging copy, published only after the D32 check: written
-    # straight into os.environ, a forbidden plane URL or credential would be live for any request
-    # (the config poller, another thread's write) until the check reverted it.
-    staged = dict(environ_before)
+    # A reset means re-fetch active sources, not treating their own last value as a shell override.
+    # Current dotenv/managed values remain in place; source-owned values are rebased before applying.
+    from agent.secret_scope import load_env_file
+    dotenv_names = set(load_env_file(home_path / ".env")) | set(_MANAGED_DOTENV_KEYS)
+    active_sources = set(active) if active is not None else set()
+    staged, remove, rebased = _stage_source_owned_values_for_refresh(
+        environ_before, _SECRET_SOURCE_WRITES_BY_HOME.get(home_key, {}), active_sources, dotenv_names)
     try:
         report = apply_all(cfg, home_path, environ=staged)
     except Exception:
@@ -977,12 +1032,14 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     if not report.sources:  # no source enabled: keep retrying cheaply so flipping one on takes effect
         return
     _refuse_protected_env_from_sources(report, backend_before, environ_before, env=staged)
-    _publish_staged_env(staged, environ_before)
+    _restore_failed_source_values(staged, remove, rebased, report)
+    _publish_staged_env(staged, environ_before, remove=remove)
 
     # A real fetch attempt happened (success OR error): mark the home so the 3-5 import-time calls per
     # startup don't re-fetch / re-print (error retries are opt-in via reset_secret_source_cache()).
     # Marking AFTER the attempt keeps the earlier failure paths retryable.
     _APPLIED_HOMES.add(home_key)
+    _SECRET_SOURCE_APPLIED_SIGNATURES_BY_HOME[home_key] = config_signature
 
     if report.applied_any:
         _sanitize_loaded_credentials()  # vault values carry the same copy-paste corruption risk as .env
@@ -1007,6 +1064,11 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     _SECRET_SOURCE_RESTORE_BY_HOME[home_key] = {
         n: values[n] for n, a in report.provenance.items() if a.authoritative and n in values}
 
+    _print_secret_source_report(report, cfg, home_key)
+
+
+def _print_secret_source_report(report, cfg: dict, home_key: str) -> None:
+    """Print sanitized status for the last secret-source pass."""
     for src in report.sources:
         if src.applied:
             print(f"  {src.label}: applied {len(src.applied)} "
@@ -1063,28 +1125,42 @@ def _remediation_hint(source_name: str, error_kind, secrets_cfg: dict, *, scope:
 
 
 def _load_secrets_config(home_path: Path) -> dict:
-    """Read just the ``secrets:`` section of config.yaml, isolated so a malformed config can't break dotenv."""
-    from hermes_cli.config_backend import config_exists, read_config_doc_readonly
+    """Read raw settings and compose enabled manifest defaults for early secret-source bootstrap."""
+    from hermes_cli.config_backend import read_config_doc_readonly
 
     config_path = home_path / "config.yaml"
-    if not config_exists(config_path):
-        return {}
-    # Prefer the shared raw-config cache: this is the first config.yaml read of a normal startup, so
-    # populating it lets main.py's early bridge and hermes_logging reuse one parse instead of 3-4.
+    data: dict = {}
     if home_path == _process_hermes_home():
         try:
             from hermes_cli.config import read_raw_config
+            loaded = read_raw_config() or {}
+        except Exception:  # health: allow BLE001 -- early secret bootstrap is fail-open; diagnostics may contain secrets
+            loaded = {}
+    else:
+        try:
+            loaded = read_config_doc_readonly(config_path) or {}
+        except Exception:  # health: allow BLE001 -- early secret bootstrap is fail-open; diagnostics may contain secrets
+            loaded = {}
+    if isinstance(loaded, dict):
+        data = loaded
 
-            data = read_raw_config() or {}
-            return data.get("secrets") or {}
-        except Exception:
-            pass
-    # Routed profiles re-enter their scope on every poll/turn; only re-parse after the file changed.
-    try:
-        data = read_config_doc_readonly(config_path) or {}
-    except Exception:
-        return {}
-    return data.get("secrets") or {}
+    from hermes_cli import managed_scope
+    from hermes_cli.config import _expand_env_vars, _normalize_root_model_keys
+    from hermes_cli.config_plugin_defaults import compose_user_layer
+    from hermes_cli.plugins_config_defaults import collect_config_default_layers
+
+    normalized = _normalize_root_model_keys(data.copy())
+    managed = managed_scope.load_managed_config() or {}
+    layers, _plugin_signature = collect_config_default_layers(home_path, normalized, managed)
+    effective = compose_user_layer(normalized, layers)
+    effective = _expand_env_vars(effective)
+    effective = managed_scope.apply_managed_overlay(effective)
+    secrets = effective.get("secrets") if isinstance(effective, dict) else None
+    result = secrets if isinstance(secrets, dict) else {}
+    home_key = str(Path(home_path).resolve())
+    signature = hashlib.sha256(json.dumps(result, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+    _SECRET_SOURCE_CONFIG_SIGNATURES_BY_HOME[home_key] = signature
+    return result
 
 
 def _process_hermes_home() -> Path:

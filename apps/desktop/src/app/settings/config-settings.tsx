@@ -7,7 +7,12 @@ import { useSearchParams } from 'react-router'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { SegmentedControl } from '@/components/ui/segmented-control'
-import { getElevenLabsVoices, getHermesConfigSchema, saveHermesConfig } from '@/hermes'
+import {
+  getElevenLabsVoices,
+  getHermesConfigRecord,
+  getHermesConfigSchema,
+  saveHermesConfig
+} from '@/hermes'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { isSubmitEnter } from '@/lib/ime'
@@ -32,7 +37,8 @@ import { notify, notifyError } from '@/store/notifications'
 import { normalizeProfileKey } from '@/store/profile'
 import { repoDiscoveryPolicyFromConfig, repoDiscoveryPolicySignature, scanAndRecordRepos } from '@/store/projects'
 import { $settingsRequestProfile } from '@/store/settings-scope'
-import type { ConfigFieldSchema, HermesConfigRecord } from '@/types/hermes'
+import type { ConfigFieldSchema } from '@/types/config-field-schema'
+import type { HermesConfigRecord } from '@/types/hermes'
 
 import { hermesConfigCacheWriter, useHermesConfigRecord } from '../hooks/use-config-record'
 import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
@@ -46,12 +52,15 @@ import { SubagentModelGate } from './delegation/subagent-model-gate'
 import {
   clearsEnabledToolsets,
   configFieldValue,
-  diffConfig,
   enumOptionsFor,
+  explicitConfigPatch,
+  explicitConfigPaths,
   getNested,
   isExternalMemoryProvider,
+  mergeConfigPatch,
   sectionFieldEntries,
   setConfigField,
+  setNested,
   voiceFieldVisible
 } from './helpers'
 import { MemoryConnect } from './memory/connect'
@@ -126,6 +135,9 @@ function ConfigSettingsInner({
   // from — and saved back through — the shared config cache, so edits are visible
   // in the MCP/model surfaces and reopening the page doesn't reload-flash.
   const [config, setConfig] = useState<HermesConfigRecord | null>(null)
+  const [rawConfig, setRawConfig] = useState<HermesConfigRecord | null>(null)
+  const [rawConfigStatus, setRawConfigStatus] = useState<'error' | 'loading' | 'ready'>('loading')
+  const [rawConfigRetry, setRawConfigRetry] = useState(0)
 
   const {
     data: loadedConfig,
@@ -161,11 +173,9 @@ function ConfigSettingsInner({
   // Seed the local draft once, the first time the shared record lands.
   // Background refetches thereafter must not clobber in-progress edits.
   const configSeeded = useRef(false)
-  // Snapshot of the record as it was when the draft was seeded. Autosave
-  // diffs the draft against this (not against disk) so a field the user
-  // never touched — possibly changed out-of-band by `hermes config set`
-  // while this page sat open — is never resent with its stale value.
-  const configBaselineRef = useRef<HermesConfigRecord | null>(null)
+  // Autosave persists only paths delivered by actual field/import events; value equality cannot
+  // distinguish an untouched inherited default from an explicit equal-value choice.
+  const editedPathsRef = useRef(new Set<string>())
   // Serializes autosave requests so an older save that's still in flight can't
   // resolve after a newer one and re-advance the baseline / cache with stale
   // data — each save's diff+request only starts once the previous one lands.
@@ -175,11 +185,28 @@ function ConfigSettingsInner({
   useEffect(() => {
     if (loadedConfig && !configSeeded.current) {
       configSeeded.current = true
-      configBaselineRef.current = loadedConfig
       savedDiscoverySignatureRef.current = repoDiscoveryPolicySignature(repoDiscoveryPolicyFromConfig(loadedConfig))
       setConfig(loadedConfig)
     }
   }, [loadedConfig])
+
+  useEffect(() => {
+    let cancelled = false
+    void getHermesConfigRecord(scopeProfile, { rawSource: true })
+      .then(source => {
+        if (!cancelled) {
+          setRawConfig(source)
+          setRawConfigStatus('ready')
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setRawConfig(null)
+          setRawConfigStatus('error')
+        }
+      })
+    return () => void (cancelled = true)
+  }, [scopeProfile, rawConfigRetry])
 
   // A profile switch invalidates (but doesn't clear) the shared config query, so
   // the local draft would otherwise keep profile A's data and autosave it into
@@ -187,9 +214,11 @@ function ConfigSettingsInner({
   // the pending debounced autosave is cancelled by its effect cleanup.
   useOnProfileSwitch(() => {
     configSeeded.current = false
-    configBaselineRef.current = null
     savedDiscoverySignatureRef.current = undefined
     setConfig(null)
+    setRawConfig(null)
+    setRawConfigStatus('loading')
+    editedPathsRef.current.clear()
     saveVersionRef.current = 0
     setSaveVersion(0)
     saveQueueRef.current = Promise.resolve()
@@ -228,30 +257,29 @@ function ConfigSettingsInner({
     const snapshot = config
 
     const t = window.setTimeout(() => {
+      const submittedPaths = [...editedPathsRef.current]
       // Chained onto the queue (not fired directly) so an older save that's
       // still awaiting its response can't land after this one and undo its
-      // baseline advance — each save's diff is computed once its predecessor
-      // has fully resolved.
+      // write — each explicit patch starts after its predecessor resolves.
       saveQueueRef.current = saveQueueRef.current.then(async () => {
         try {
-          const patch = diffConfig(configBaselineRef.current ?? {}, snapshot)
+          const patch = explicitConfigPatch(snapshot, submittedPaths)
           const result = await saveHermesConfig(patch, writeScope ?? scopeProfile)
 
           if (!result.ok) {
             throw new Error(c.autosaveFailed)
           }
 
-          // The saved snapshot becomes the new baseline, so the next autosave
-          // diffs against what's actually on disk instead of the page-load
-          // (or last-baseline) copy — otherwise reverting a field to its
-          // pre-save value diffs to nothing and the revert never reaches disk.
-          configBaselineRef.current = snapshot
-
-          // Mirror the saved record into the shared cache so MCP/model surfaces
-          // reflect the edit without their own refetch.
-          writeConfigCache(snapshot)
           const savedScope = writeScope ?? scopeProfile
-
+          setRawConfig(null)
+          setRawConfigStatus('loading')
+          setRawConfigRetry(current => current + 1)
+          const savedConfig = await getHermesConfigRecord(savedScope)
+          writeConfigCache(savedConfig)
+          if (saveVersionRef.current === v) {
+            editedPathsRef.current.clear()
+            setConfig(savedConfig)
+          }
           recordSettingsSaved(patch, schema ?? {}, typeof savedScope === 'string' ? savedScope : savedScope?.profile)
 
           // The Memory summary's "active" provider is the saved one; reread it.
@@ -285,13 +313,22 @@ function ConfigSettingsInner({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- copy is stable; avoid re-scheduling autosave on locale change
   }, [config, onConfigSaved, saveVersion, writeScope, scopeProfile])
 
-  const applyConfig = (next: HermesConfigRecord) => {
+  const retryRawConfig = () => {
+    setRawConfig(null)
+    setRawConfigStatus('loading')
+    setRawConfigRetry(current => current + 1)
+  }
+
+  const applyConfig = (next: HermesConfigRecord, paths: Iterable<string> = []) => {
+    for (const path of paths) {
+      editedPathsRef.current.add(path)
+    }
     saveVersionRef.current += 1
     setConfig(next)
     setSaveVersion(saveVersionRef.current)
   }
 
-  const updateConfig = (next: HermesConfigRecord) => {
+  const updateConfig = (next: HermesConfigRecord, paths: Iterable<string> = []) => {
     // Guard the single most destructive config edit: clearing the entire
     // "Enabled Toolsets" list silently disables memory, terminal, web search,
     // delegation, and most tools, and a stray select-all + Backspace can do it.
@@ -300,14 +337,14 @@ function ConfigSettingsInner({
     if (config && clearsEnabledToolsets(config, next)) {
       void confirm({ destructive: true, title: c.toolsetsWipeConfirm }).then(ok => {
         if (ok) {
-          applyConfig(next)
+          applyConfig(next, paths)
         }
       })
 
       return
     }
 
-    applyConfig(next)
+    applyConfig(next, paths)
   }
 
   const sectionFields = useMemo(() => {
@@ -374,6 +411,11 @@ function ConfigSettingsInner({
   }, [activeSectionId, config, schema, setSearchParams, subpage, targetField])
 
   function handleImport(e: ChangeEvent<HTMLInputElement>) {
+    if (rawConfigStatus !== 'ready') {
+      e.target.value = ''
+      return
+    }
+
     const file = e.target.files?.[0]
 
     if (!file) {
@@ -384,7 +426,9 @@ function ConfigSettingsInner({
 
     reader.onload = () => {
       try {
-        updateConfig(JSON.parse(String(reader.result)))
+        const imported = JSON.parse(String(reader.result)) as HermesConfigRecord
+        updateConfig(imported, explicitConfigPaths(imported))
+        setRawConfig(previous => previous ? mergeConfigPatch(previous, imported) : previous)
         notify({ kind: 'success', title: c.imported, message: t.common.saving })
       } catch (err) {
         notifyError(err, c.invalidJson)
@@ -400,6 +444,12 @@ function ConfigSettingsInner({
   const renderPage = (children: ReactNode) => (
     <SettingsContent>
       <SettingsProfileScope className="mb-5" />
+      {rawConfigStatus === 'error' && (
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-destructive/40 bg-destructive/5 p-3" role="alert">
+          <span className="text-sm">{c.failedLoad}</span>
+          <Button onClick={retryRawConfig} size="sm">{t.common.refresh}</Button>
+        </div>
+      )}
       {activeSectionId === 'model' && (
         <div className={showModelSettings ? 'mb-6' : undefined}>
           <ModelSettings onMainModelChanged={onMainModelChanged} scopeProfile={scopeProfile} subpage={subpage} />
@@ -409,6 +459,7 @@ function ConfigSettingsInner({
       <input
         accept=".json,application/json"
         className="hidden"
+        disabled={rawConfigStatus !== 'ready'}
         onChange={handleImport}
         ref={importInputRef}
         type="file"
@@ -541,7 +592,11 @@ function ConfigSettingsInner({
             <div className="scroll-mt-6 rounded-lg" id={`setting-field-${key}`} key={key}>
               {key === 'delegation.model' ? (
                 <SubagentModelGate scope={writeScope ?? scopeProfile}>
-                  <DelegationRouteRow config={config} onConfigChange={updateConfig} scope={writeScope ?? scopeProfile} />
+                  <DelegationRouteRow
+                    config={config}
+                    onConfigChange={(next, paths) => updateConfig(next, paths)}
+                    scope={writeScope ?? scopeProfile}
+                  />
                 </SubagentModelGate>
               ) : (
                 <ConfigField
@@ -550,16 +605,30 @@ function ConfigSettingsInner({
                       <MemoryConnect profile={scopeProfile} provider={String(getNested(config, key))} />
                     ) : undefined
                   }
+                  disabled={field.plugin_default && field.type === 'list' && rawConfigStatus !== 'ready'}
                   enumOptions={
                     key === 'tts.elevenlabs.voice_id'
                       ? enumOptionsFor(key, getNested(config, key), config, elevenLabsVoiceOptions ?? undefined)
                       : enumOptionsFor(key, getNested(config, key), config)
                   }
-                  onChange={value => updateConfig(setConfigField(config, key, value))}
+                  onChange={value => {
+                    if (field.plugin_default && field.type === 'list' && rawConfigStatus !== 'ready') {
+                      return
+                    }
+                    if (field.plugin_default && field.type === 'list') {
+                      setRawConfig(previous => previous ? setNested(previous, key, value) : previous)
+                    }
+                    updateConfig(setConfigField(config, key, value), [key])
+                  }}
                   optionLabels={key === 'tts.elevenlabs.voice_id' ? elevenLabsVoiceLabels : undefined}
+                  placeholder={field.plugin_default && field.type === 'list' && rawConfigStatus !== 'ready'
+                    ? rawConfigStatus === 'loading' ? t.common.loading : c.failedLoad
+                    : undefined}
                   schema={field}
                   schemaKey={key}
-                  value={configFieldValue(config, key)}
+                  value={field.plugin_default && field.type === 'list'
+                    ? rawConfig ? getNested(rawConfig, key) : undefined
+                    : configFieldValue(config, key)}
                 />
               )}
               {key === 'memory.provider' && isExternalMemoryProvider(getNested(config, key)) ? (

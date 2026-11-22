@@ -243,7 +243,7 @@ def _save_port(port: int) -> None:
     cfg = load_config()
     webapp = cfg.get("webapp")
     cfg["webapp"] = {**(webapp if isinstance(webapp, dict) else {}), "port": port}
-    save_config(cfg)
+    save_config(cfg, preserve_keys={("webapp", "port")})
 
 
 def _own_port(home: Path) -> Optional[object]:
@@ -340,7 +340,13 @@ def _write_config(*, enabled: bool, host: str = "", public_url: str = "", port: 
     elif enabled:
         webapp.pop("public_url", None)
     cfg["webapp"] = webapp
-    save_config(cfg)
+    preserve = {("webapp", "enabled")}
+    if enabled:
+        preserve.add(("webapp", "host"))
+        if port:
+            preserve.add(("webapp", "port"))
+        preserve.add(("webapp", "public_url"))
+    save_config(cfg, preserve_keys=preserve)
 
 
 def _gateway_state(home: Path) -> dict:

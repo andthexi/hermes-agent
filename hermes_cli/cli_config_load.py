@@ -264,19 +264,29 @@ def load_cli_config() -> dict[str, Any]:
 
     defaults = _cli_config_defaults()
 
-    # Only a file's terminal section may overwrite terminal env vars already set by .env.
+    # Only a raw user's terminal section may overwrite terminal env vars already set by .env.
     _file_has_terminal_config = False
-
-    if os.environ.get("HERMES_IGNORE_USER_CONFIG") != "1" and config_exists(config_path):
+    ignore_user_config = os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1"
+    file_config: dict[str, Any] = {}
+    if not ignore_user_config and config_exists(config_path):
         try:
             from hermes_cli.config import _normalize_root_model_keys
 
-            file_config = _normalize_root_model_keys(read_config_doc(config_path) or {})
-
+            loaded = read_config_doc(config_path) or {}
+            file_config = _normalize_root_model_keys(loaded)
             _file_has_terminal_config = "terminal" in file_config
-            _merge_file_config(defaults, file_config)
         except Exception as e:
             logger.warning("Failed to load %s: %s", config_path, e)
+
+    if not ignore_user_config:
+        from hermes_cli import managed_scope
+        from hermes_cli.config_plugin_defaults import compose_user_layer
+        from hermes_cli.plugins_config_defaults import collect_config_default_layers
+
+        managed_bootstrap = managed_scope.load_managed_config() or {}
+        layers, _signature = collect_config_default_layers(_hermes_home, file_config, managed_bootstrap)
+        file_config = compose_user_layer(file_config, layers)
+        _merge_file_config(defaults, file_config)
 
     # Expand ${ENV_VAR} references before bridging to env vars.
     from hermes_cli.config import _expand_env_vars

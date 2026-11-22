@@ -2,20 +2,9 @@ import type { ConnectionRequestPayload, FreeTierChallengePayload, ToolLabel } fr
 
 import type { ToolResultMetadata } from '@/lib/tool-result-metadata'
 
-export type StoredToolCallLabels = Record<string, ToolLabel[]>
+import type { ConfigFieldSchema } from './config-field-schema'
 
-export interface ConfigFieldSchema {
-  category?: string
-  description?: string
-  options?: unknown[]
-  /** When true, renders a SearchableSelect (Popover + cmdk) instead of the
-   *  closed `<Select>` dropdown. For large option lists like IANA timezones. */
-  searchable?: boolean
-  /** When true, a searchable select prepends a "clear" item that resets the
-   *  value to ''. Matches the existing <Select> EMPTY_SELECT_VALUE pattern. */
-  clearable?: boolean
-  type?: 'boolean' | 'list' | 'number' | 'select' | 'string' | 'text'
-}
+export type StoredToolCallLabels = Record<string, ToolLabel[]>
 
 export interface ConfigSchemaResponse {
   category_order?: string[]

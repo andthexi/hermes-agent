@@ -16,7 +16,7 @@ import { hermesConfigCacheWriter, useHermesConfigRecord } from '../hooks/use-con
 
 import { ConfigField } from './config-field'
 import { SECTIONS } from './constants'
-import { diffConfig, enumOptionsFor, getNested, inferFieldSchema, setNested } from './helpers'
+import { enumOptionsFor, explicitConfigPatch, getNested, inferFieldSchema, setNested } from './helpers'
 
 // The curated voice keys (Settings → Voice) are the single source of which
 // per-provider fields exist; both the Voice settings page and the
@@ -72,18 +72,14 @@ export function VoiceProviderFields({
   // refetches must not clobber in-progress edits) — the same shape as
   // config-settings.tsx's autosave loop.
   const [config, setConfig] = useState<HermesConfigRecord | null>(null)
-  // Autosave sends only what changed against this baseline (config-settings.tsx
-  // pattern): the seeded record is a default-expanded snapshot, and echoing it
-  // whole would overwrite keys other surfaces changed since it loaded. The
-  // baseline advances to each successfully saved draft.
-  const [baseline, setBaseline] = useState<HermesConfigRecord | null>(null)
+  // Track user-edited fields directly; an equal-to-default edit still carries intent.
+  const editedPathsRef = useRef(new Set<string>())
   const seeded = useRef(false)
 
   // eslint-disable-next-line no-restricted-syntax -- one-shot config seed flag, not an atom mirror
   useEffect(() => {
     if (loadedConfig && !seeded.current) {
       seeded.current = true
-      setBaseline(loadedConfig)
       setConfig(loadedConfig)
     }
   }, [loadedConfig])
@@ -96,17 +92,20 @@ export function VoiceProviderFields({
       return
     }
 
+    const submittedPaths = [...editedPathsRef.current]
     const timeout = window.setTimeout(() => {
-      void saveHermesConfigRecord(diffConfig(baseline ?? {}, config), writeScope ?? profile)
+      void saveHermesConfigRecord(explicitConfigPatch(config, submittedPaths), writeScope ?? profile)
         .then(() => {
-          setBaseline(config)
           writeConfigCache(config)
+          if (saveVersionRef.current === saveVersion) {
+            editedPathsRef.current.clear()
+          }
         })
         .catch(err => notifyError(err, t.settings.config.autosaveFailed))
     }, 550)
 
     return () => window.clearTimeout(timeout)
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- copy is stable; `profile`/`baseline` are keyed by scopeKey; avoid re-scheduling autosave on locale change
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- scopeKey binds profile; avoid re-scheduling autosave on locale change
   }, [config, scopeKey, saveVersion, writeConfigCache, writeScope])
 
   // ElevenLabs cloned/library voices from the live account, when available —
@@ -147,7 +146,8 @@ export function VoiceProviderFields({
 
   const schema = schemaResponse?.fields ?? {}
 
-  const updateConfig = (next: HermesConfigRecord) => {
+  const updateConfig = (next: HermesConfigRecord, path: string) => {
+    editedPathsRef.current.add(path)
     saveVersionRef.current += 1
     setConfig(next)
     setSaveVersion(saveVersionRef.current)
@@ -164,7 +164,7 @@ export function VoiceProviderFields({
           <ConfigField
             enumOptions={enumOptionsFor(key, value, config, isElVoice ? (elVoices ?? undefined) : undefined)}
             key={key}
-            onChange={next => updateConfig(setNested(config, key, next))}
+            onChange={next => updateConfig(setNested(config, key, next), key)}
             optionLabels={isElVoice ? elVoiceLabels : undefined}
             schema={field}
             schemaKey={key}

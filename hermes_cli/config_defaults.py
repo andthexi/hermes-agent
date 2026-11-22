@@ -2443,9 +2443,8 @@ DEFAULT_CONFIG = {
         },
     },
     "secrets": {
-        # Optional ordering of enabled sources (e.g. [onepassword, bitwarden]); default registration
-        # order. Mapped sources (explicit VAR→ref) always beat bulk sources (BSM project dumps);
-        # first claim on a var wins, later ones warn. "sources": [],
+        # Optional source order (e.g. [onepassword, bitwarden]); default registration order.
+        # Mapped VAR→ref sources beat bulk project sources; first claim wins, later ones warn.
         "bitwarden": {
             "enabled": False,  # When false, BSM is never contacted and bws is never auto-installed.
             # Env var holding the machine-account token — the one bootstrap secret; lives in
@@ -2482,6 +2481,7 @@ DEFAULT_CONFIG = {
             # Overwrite existing env vars so rotation takes effect; False lets .env win.
             "override_existing": True,
         },
+        "file": {"enabled": False, "path": "", "override_existing": False},
     },
     # Paste collapse thresholds (TUI + CLI); 0 disables each. threshold: bracketed pastes with this
     # many newlines collapse to a file reference. fallback: same test for terminals without

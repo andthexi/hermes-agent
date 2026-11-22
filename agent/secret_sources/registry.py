@@ -48,6 +48,7 @@ _BUILTIN_SOURCES = (
     ("agent.secret_sources.bitwarden", "BitwardenSource", "Bitwarden"),
     ("agent.secret_sources.onepassword", "OnePasswordSource", "1Password"),
     ("agent.secret_sources.command", "CommandSource", "command"),
+    ("agent.secret_sources.file", "FileSource", "dotenv file"),
 )
 
 
@@ -140,6 +141,11 @@ def register_source(source: SecretSource, *, replace: bool = False, builtin: boo
 
 
 def get_source(name: str, *, scope: Optional[str] = None) -> Optional[SecretSource]:
+    """Return a registered source for capability checks; never calls ``fetch()``.
+
+    With ``scope=None`` the active profile-bound registry is used. This is the
+    narrow plugin API for checking native-source availability during register().
+    """
     _ensure_builtin_sources()
     return _registry.merged(scope).get(name)
 

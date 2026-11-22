@@ -28,8 +28,8 @@ const defaultConfigClient: I18nConfigClient = {
       return Promise.resolve({})
     }
 
-    // Merged defaults make an unset language indistinguishable from saved English.
-    // Older backends ignore the option and keep returning English as before.
+    // Keep the legacy normalized-source read: a merged built-in default would
+    // make an unset language indistinguishable from a saved English choice.
     return getHermesConfigRecord(undefined, { includeDefaults: false })
   },
   saveConfig: config => {
@@ -49,16 +49,8 @@ export function getConfigDisplayLanguage(config: HermesConfigRecord): unknown {
 }
 
 export function withConfigDisplayLanguage(config: HermesConfigRecord, locale: Locale): HermesConfigRecord {
-  const display = isRecord(config.display) ? config.display : {}
-
   return retainConfigReadOrigin(
-    {
-      ...config,
-      display: {
-        ...display,
-        language: localeConfigValue(locale)
-      }
-    },
+    { display: { language: localeConfigValue(locale) } },
     config
   )
 }

@@ -36,6 +36,7 @@ _KNOWN_MANIFEST_FIELDS: set[str] = {
     "manifest_version", "api_version", "requires_plugins", "python_dependencies", "config_schema",
     "license", "homepage", "tags", "capabilities", "emits", "listens", "hermes", "depends",
     "requires_hermes", "python_runtime", "provides_locales", "requires_auth", "oauth", "config_keys",
+    "config_defaults",
 }
 
 # Highest manifest schema version this Hermes understands.
@@ -49,11 +50,6 @@ _CONFIG_SCHEMA_TYPES: dict[str, tuple] = {
     # only ever a stray string.
     "secret": (str,),
 }
-
-
-def _plugins_debug() -> bool:
-    from hermes_cli import plugins as _origin
-    return _origin._PLUGINS_DEBUG
 
 
 def _portable_data_namespace(key: str) -> str:
@@ -417,6 +413,9 @@ class PluginManifest:
     # Dotted paths in Hermes' own config sections the plugin reads (``memory.retaindb``), so
     # ``hermes config get/set`` recognizes them while the plugin is active (hermes_cli/config_runtime_keys.py).
     config_keys: list[str] = field(default_factory=list)
+    # Optional pure-data defaults; validated only when the winning manifest is explicitly enabled.
+    config_defaults: Any = None
+    has_config_defaults: bool = False
 
 
 def parse_provides_locales(raw: Any, key: str = "") -> tuple[list[str], dict[str, dict[str, Any]]]:
@@ -580,7 +579,9 @@ def parse_manifest_file(
             **_parse_manifest_v2_fields(data, key), emits=data.get("emits") or [],
             listens=data.get("listens") or [],
             provides_locales=provides_locales, locale_metadata=locale_metadata,
+            config_defaults=data.get("config_defaults"), has_config_defaults="config_defaults" in data,
         )
-    except Exception as exc:
-        logger.warning("Failed to parse %s: %s", manifest_file, exc, exc_info=_plugins_debug())
+    except Exception:  # health: allow BLE001 -- parser errors may quote private manifest scalar values
+        # YAML parser exceptions may quote a scalar; manifest values are not diagnostics.
+        logger.warning("Failed to parse plugin manifest %s: invalid manifest data", manifest_file)
         return None

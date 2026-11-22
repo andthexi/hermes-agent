@@ -5,7 +5,12 @@ import { Label } from "@nous-research/ui/ui/components/label";
 
 function FieldHint({ schema, schemaKey }: { schema: Record<string, unknown>; schemaKey: string }) {
   const keyPath = schemaKey.includes(".") ? schemaKey : "";
-  const description = schema.description ? String(schema.description) : "";
+  const mergeDescription = schema.plugin_default
+    ? String(schema.merge_description ?? "Plugin-provided defaults remain active; this list edits only your profile entries.")
+    : "";
+  const description = [schema.description ? String(schema.description) : "", mergeDescription]
+    .filter(Boolean)
+    .join(" ");
 
   if (!keyPath && !description) return null;
 
@@ -32,10 +37,12 @@ function NestedValueEditor({
   fieldKey,
   value,
   onChange,
+  disabled,
 }: {
   fieldKey: string;
   value: unknown;
   onChange: (v: unknown) => void;
+  disabled: boolean;
 }) {
   if (isRecord(value)) {
     return (
@@ -46,6 +53,7 @@ function NestedValueEditor({
             <NestedValueEditor
               fieldKey={`${fieldKey}.${subKey}`}
               value={subVal}
+              disabled={disabled}
               onChange={(next) => onChange({ ...value, [subKey]: next })}
             />
           </div>
@@ -63,6 +71,7 @@ function NestedValueEditor({
             <NestedValueEditor
               fieldKey={`${fieldKey}.${index}`}
               value={item}
+              disabled={disabled}
               onChange={(next) =>
                 onChange(value.map((existing, i) => (i === index ? next : existing)))
               }
@@ -76,6 +85,7 @@ function NestedValueEditor({
   return (
     <Input
       value={formatScalar(value)}
+      disabled={disabled}
       onChange={(e) => onChange(e.target.value)}
       className="text-xs"
     />
@@ -87,6 +97,8 @@ export function AutoField({
   schema,
   value,
   onChange,
+  disabled = false,
+  placeholder,
 }: AutoFieldProps) {
   const rawLabel = schemaKey.split(".").pop() ?? schemaKey;
   const label = rawLabel.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
@@ -96,7 +108,7 @@ export function AutoField({
       <div className="grid gap-3 border border-border p-3">
         <Label className="text-xs font-medium">{label}</Label>
         <FieldHint schema={schema} schemaKey={schemaKey} />
-        <NestedValueEditor fieldKey={schemaKey} value={value} onChange={onChange} />
+        <NestedValueEditor fieldKey={schemaKey} value={value} onChange={onChange} disabled={disabled} />
       </div>
     );
   }
@@ -108,7 +120,7 @@ export function AutoField({
           <Label className="text-sm">{label}</Label>
           <FieldHint schema={schema} schemaKey={schemaKey} />
         </div>
-        <Switch checked={!!value} onCheckedChange={onChange} />
+        <Switch checked={!!value} onCheckedChange={onChange} disabled={disabled} />
       </div>
     );
   }
@@ -119,7 +131,7 @@ export function AutoField({
       <div className="grid gap-1.5">
         <Label className="text-sm">{label}</Label>
         <FieldHint schema={schema} schemaKey={schemaKey} />
-        <Select value={String(value ?? "")} onValueChange={(v) => onChange(v)}>
+        <Select value={String(value ?? "")} onValueChange={(v) => onChange(v)} disabled={disabled}>
           {options.map((opt) => (
             <SelectOption key={opt} value={opt}>
               {opt || "(none)"}
@@ -136,6 +148,7 @@ export function AutoField({
         <Label className="text-sm">{label}</Label>
         <FieldHint schema={schema} schemaKey={schemaKey} />
         <Input
+          disabled={disabled}
           type="number"
           value={value === undefined || value === null ? "" : String(value)}
           onChange={(e) => {
@@ -160,6 +173,7 @@ export function AutoField({
         <Label className="text-sm">{label}</Label>
         <FieldHint schema={schema} schemaKey={schemaKey} />
         <textarea
+          disabled={disabled}
           className="flex min-h-[80px] w-full border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
           value={String(value ?? "")}
           onChange={(e) => onChange(e.target.value)}
@@ -174,6 +188,8 @@ export function AutoField({
         <Label className="text-sm">{label}</Label>
         <FieldHint schema={schema} schemaKey={schemaKey} />
         <Input
+          disabled={disabled}
+          placeholder={placeholder ?? "comma-separated values"}
           value={Array.isArray(value) ? value.join(", ") : String(value ?? "")}
           onChange={(e) =>
             onChange(
@@ -183,7 +199,6 @@ export function AutoField({
                 .filter(Boolean),
             )
           }
-          placeholder="comma-separated values"
         />
       </div>
     );
@@ -193,7 +208,7 @@ export function AutoField({
     <div className="grid gap-1.5">
       <Label className="text-sm">{label}</Label>
       <FieldHint schema={schema} schemaKey={schemaKey} />
-      <Input value={String(value ?? "")} onChange={(e) => onChange(e.target.value)} />
+      <Input disabled={disabled} placeholder={placeholder} value={String(value ?? "")} onChange={(e) => onChange(e.target.value)} />
     </div>
   );
 }
@@ -203,4 +218,6 @@ interface AutoFieldProps {
   schema: Record<string, unknown>;
   value: unknown;
   onChange: (v: unknown) => void;
+  disabled?: boolean;
+  placeholder?: string;
 }

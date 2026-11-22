@@ -1,7 +1,8 @@
 import { foldPersonalityName } from '@/lib/personalities'
 import { asText, normalize } from '@/lib/text'
 import { localShowReasoning } from '@/store/reasoning-disclosure'
-import type { ConfigFieldSchema, HermesConfig, HermesConfigRecord, ToolsetInfo } from '@/types/hermes'
+import type { ConfigFieldSchema } from '@/types/config-field-schema'
+import type { HermesConfig, HermesConfigRecord, ToolsetInfo } from '@/types/hermes'
 
 import { BUILTIN_PERSONALITIES, ENUM_OPTIONS, PROVIDER_GROUPS, SECTIONS } from './constants'
 
@@ -72,13 +73,32 @@ function isSafePart(part: string): boolean {
 }
 
 function configPathParts(path: string): string[] {
-  const parts = path.split('.')
-
+  const parts: string[] = []
+  let current = ''
+  for (let index = 0; index < path.length; index += 1) {
+    const char = path[index]
+    if (char === '\\' && path[index + 1] === '.') {
+      current += '.'
+      index += 1
+    } else if (char === '.') {
+      parts.push(current)
+      current = ''
+    } else {
+      current += char
+    }
+  }
+  parts.push(current)
   if (!parts.every(isSafePart)) {
     throw new Error(`Unsafe config path: ${path}`)
   }
-
   return parts
+}
+
+function formatConfigPath(parts: string[]): string {
+  if (!parts.every(isSafePart)) {
+    throw new Error('Unsafe config path')
+  }
+  return parts.map(part => part.replace(/\./g, '\\.')).join('.')
 }
 
 function safeSet(target: Record<string, unknown>, key: string, value: unknown): void {
@@ -128,6 +148,45 @@ const isPlainObject = (value: unknown): value is Record<string, unknown> =>
  * now-stale value. `PUT /api/config` deep-merges onto disk, so an omitted
  * key keeps whatever is currently there.
  */
+export function explicitConfigPatch(config: HermesConfigRecord, paths: Iterable<string>): HermesConfigRecord {
+  let patch: HermesConfigRecord = {}
+  for (const path of paths) {
+    patch = setNested(patch, path, getNested(config, path))
+  }
+  return patch
+}
+
+export function mergeConfigPatch(base: HermesConfigRecord, patch: HermesConfigRecord): HermesConfigRecord {
+  const result = structuredClone(base)
+  for (const [key, value] of Object.entries(patch)) {
+    if (!isSafePart(key)) {
+      throw new Error(`Unsafe config key: ${key}`)
+    }
+    const oldValue = Object.prototype.hasOwnProperty.call(result, key) ? result[key] : undefined
+    const merged = isPlainObject(oldValue) && isPlainObject(value)
+      ? mergeConfigPatch(oldValue, value)
+      : structuredClone(value)
+    safeSet(result, key, merged)
+  }
+  return result
+}
+
+export function explicitConfigPaths(config: HermesConfigRecord): string[] {
+  const paths: string[] = []
+  const visit = (node: Record<string, unknown>, prefix: string[] = []) => {
+    for (const [key, value] of Object.entries(node)) {
+      const path = [...prefix, key]
+      if (isPlainObject(value) && Object.keys(value).length > 0) {
+        visit(value, path)
+      } else {
+        paths.push(formatConfigPath(path))
+      }
+    }
+  }
+  visit(config)
+  return paths
+}
+
 export function diffConfig(base: HermesConfigRecord, next: HermesConfigRecord): HermesConfigRecord {
   const patch: HermesConfigRecord = {}
 

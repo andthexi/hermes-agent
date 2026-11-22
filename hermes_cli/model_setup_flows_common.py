@@ -69,9 +69,9 @@ def _ensure_flow_api_key(provider_id: str, pconfig, *, missing_hint=()) -> tuple
 
 
 def _load_config_model_section() -> tuple[dict, dict]:
-    """Return ``(cfg, cfg["model"])`` with the model section coerced to a dict."""
-    from hermes_cli.config import load_config
-    cfg = load_config()
+    """Return the raw ``(cfg, cfg["model"])`` write document with model coerced to a dict."""
+    from hermes_cli.config import read_raw_config
+    cfg = read_raw_config()
     model = cfg.get("model")
     if not isinstance(model, dict):
         model = {"default": model} if model else {}
@@ -90,10 +90,13 @@ def _begin_model_config(selected: str, provider: str) -> tuple[dict, dict]:
 
 
 def _commit_model_config(cfg: dict) -> None:
-    """Persist *cfg* and deactivate any OAuth provider."""
+    """Persist this model setup's explicit model paths and deactivate any OAuth provider."""
     from hermes_cli.auth import deactivate_provider
     from hermes_cli.config import save_config
-    save_config(cfg)
+    from hermes_cli.config_save import explicit_config_paths
+    model = cfg.get("model")
+    paths = explicit_config_paths({"model": model}) if isinstance(model, dict) else set()
+    save_config(cfg, preserve_keys=paths)
     deactivate_provider()
 
 

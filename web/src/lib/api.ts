@@ -3,6 +3,7 @@ import {
   type ModelOptionProvider,
   type ModelOptionsResult,
 } from "@hermes/shared";
+import { createConfigApi } from "./api-config";
 import { createDashboardSessionMutations } from "./session-mutations";
 
 const mutateSessionHttp = createDashboardSessionMutations(fetchJSON);
@@ -587,10 +588,7 @@ export const api = {
     fetchJSON<ModelsAnalyticsResponse>(
       appendProfileParam(`/api/analytics/models?days=${days}`, profile),
     ),
-  getConfig: (profile = getManagementProfile()) =>
-    fetchJSON<Record<string, unknown>>(appendProfileParam("/api/config", profile)),
-  getDefaults: () => fetchJSON<Record<string, unknown>>("/api/config/defaults"),
-  getSchema: () => fetchJSON<{ fields: Record<string, unknown>; category_order: string[] }>("/api/config/schema"),
+  ...createConfigApi(fetchJSON, appendProfileParam, getManagementProfile),
   getModelInfo: (profile = getManagementProfile()) =>
     fetchJSON<ModelInfoResponse>(appendProfileParam("/api/model/info", profile)),
   getModelOptions: (
@@ -643,22 +641,6 @@ export const api = {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(answer),
-    }),
-  saveConfig: (config: Record<string, unknown>, profile = getManagementProfile()) =>
-    fetchJSON<{ ok: boolean }>(appendProfileParam("/api/config", profile), {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ config }),
-    }),
-  getConfigRaw: (profile = getManagementProfile()) =>
-    fetchJSON<{ yaml: string; path?: string }>(
-      appendProfileParam("/api/config/raw", profile),
-    ),
-  saveConfigRaw: (yaml_text: string, profile = getManagementProfile()) =>
-    fetchJSON<{ ok: boolean }>(appendProfileParam("/api/config/raw", profile), {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ yaml_text }),
     }),
   getEnvVars: () => fetchJSON<Record<string, EnvVarInfo>>("/api/env"),
   setEnvVar: (key: string, value: string) =>

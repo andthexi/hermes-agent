@@ -1,6 +1,7 @@
 """Dashboard config schema and model-assignment logic: CONFIG_SCHEMA construction, dynamic provider options, web<->config normalisation, main/aux model assignment.
 """
 
+import copy
 import logging
 import os
 from dataclasses import replace
@@ -847,7 +848,9 @@ def _apply_main_assignment_sync(cfg: dict, provider: str, model: str, base_url: 
     # One route: a model.* key locked by the time the save runs (even after the preflight guard
     # above, or on its CAS retry) refuses the whole save instead of being omitted from it.
     with refusing_locked_omissions("model"):
-        save_config(cfg)
+        save_config(cfg, preserve_keys={
+            ("model", "default"), ("model", "provider"), ("model", "base_url"), ("model", "api_mode"),
+        })
     if new_provider in {"custom", "local"} and base_url and not endpoint_already_known:
         _register_custom_endpoint(base_url, api_key, model)
     # The serve process's boot record may still say "nothing configured"; the chat gates on it.
@@ -905,9 +908,9 @@ def _apply_aux_assignment_sync(cfg: dict, provider: str, model: str, task: str, 
     slots = _aux_task_slots()
 
     if task == "__reset__":
-        # Reset every slot to provider="auto", model="", no effort override — keeps other fields intact.
+        # Reset means remove user route overrides: inherited plugin defaults remain effective and raw YAML stays sparse.
         for slot in slots:
-            slot_cfg = _slot(slot)
+            slot_cfg = dict(_slot(slot))
             slot_cfg["provider"] = "auto"
             slot_cfg["model"] = ""
             slot_cfg.pop("reasoning_effort", None)
@@ -915,7 +918,15 @@ def _apply_aux_assignment_sync(cfg: dict, provider: str, model: str, task: str, 
             clear_model_endpoint_credentials(slot_cfg)
             aux[slot] = slot_cfg
         cfg["auxiliary"] = aux
-        save_config(cfg)
+        from hermes_cli.config import _unset_nested, read_raw_config
+        raw_config = read_raw_config()
+        route_fields = ("provider", "model", "reasoning_effort", "base_url", "api_key", "api", "key_env", "api_key_env")
+        reset_paths = [
+            ".".join(("auxiliary", slot, field)) for slot in slots for field in route_fields
+        ]
+        for path in reset_paths:
+            _unset_nested(raw_config, path)
+        save_config(raw_config)
         return {"ok": True, "scope": "auxiliary", "reset": True}
 
     if not provider:
@@ -956,7 +967,14 @@ def _apply_aux_assignment_sync(cfg: dict, provider: str, model: str, task: str, 
         aux[slot] = slot_cfg
 
     cfg["auxiliary"] = aux
-    save_config(cfg)
+    preserve = {
+        ("auxiliary", slot, field)
+        for slot in targets
+        for field in ("provider", "model", "base_url", "api_key")
+    }
+    if effort is not _UNSET:
+        preserve.update({("auxiliary", slot, "reasoning_effort") for slot in targets})
+    save_config(cfg, preserve_keys=preserve)
     result = {"ok": True, "scope": "auxiliary", "tasks": targets, "provider": provider, "model": model}
     if effort is not _UNSET:
         result["reasoning_effort"] = effort
@@ -1016,6 +1034,80 @@ def _infer_provider_on_model_change(model_val: str, prev_provider: str) -> tuple
         except Exception:
             pass
     return "", name
+
+
+def explicit_config_patch_from_web(config: dict[str, Any]) -> tuple[dict[str, Any], set[str]]:
+    """Convert only submitted web fields to raw config intent, without copying effective defaults."""
+    from hermes_cli.config import load_config, read_raw_config
+
+    patch = copy.deepcopy(config)
+    patch.pop("_model_meta", None)
+    unset_paths: set[str] = set()
+    context_length = patch.pop("model_context_length", _UNSET_WEB_VALUE)
+    raw = read_raw_config()
+    model_value = patch.get("model", _UNSET_WEB_VALUE)
+    if isinstance(model_value, str):
+        model_patch = copy.deepcopy(raw.get("model")) if isinstance(raw.get("model"), dict) else {}
+        effective_model = load_config().get("model")
+        if isinstance(effective_model, dict):
+            previous_default = str(effective_model.get("default") or "").strip()
+            previous_provider = str(effective_model.get("provider") or "").strip()
+            if model_value != previous_default and previous_provider:
+                new_provider, resolved_model = _infer_provider_on_model_change(model_value, previous_provider)
+                if new_provider and new_provider.strip().lower() != previous_provider.lower():
+                    norm_provider, norm_model = _normalize_main_model_assignment(new_provider, resolved_model)
+                    result = _validated_main_model_selection(effective_model, norm_provider, norm_model)
+                    model_patch = _apply_main_model_assignment(model_patch, result)
+                    model_value = result.new_model
+        model_patch["default"] = model_value
+        patch["model"] = model_patch
+    if context_length is not _UNSET_WEB_VALUE:
+        try:
+            length = int(context_length)
+        except (TypeError, ValueError):
+            length = 0
+        model_patch = patch.get("model")
+        if model_patch is None:
+            pass  # the explicit null model ancestor blocks the context-length descendant
+        else:
+            if not isinstance(model_patch, dict):
+                model_patch = copy.deepcopy(raw.get("model")) if isinstance(raw.get("model"), dict) else {}
+            if length > 0:
+                model_patch["context_length"] = length
+                patch["model"] = model_patch
+            else:
+                unset_paths.add("model.context_length")
+    return patch, unset_paths
+
+
+_UNSET_WEB_VALUE = object()
+
+
+def explicit_config_paths(config: dict[str, Any]) -> set[tuple[str, ...]]:
+    """Every submitted leaf path for save_config's explicit-value preservation contract."""
+    paths: set[tuple[str, ...]] = set()
+
+    def visit(node: dict[str, Any], prefix: tuple[str, ...] = ()) -> None:
+        for key, value in node.items():
+            path = (*prefix, str(key))
+            if isinstance(value, dict) and value:
+                visit(value, path)
+            else:
+                paths.add(path)
+
+    visit(config)
+    return paths
+
+
+def merge_explicit_config_patch(raw: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    """Rebase intentional path values onto fresh raw config; explicit null replaces its source."""
+    result = copy.deepcopy(raw)
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = merge_explicit_config_patch(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
 
 
 def _denormalize_config_from_web(config: dict[str, Any]) -> dict[str, Any]:

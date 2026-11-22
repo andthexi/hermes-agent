@@ -2855,15 +2855,15 @@ def _gateway_config_home() -> Path:
 
 
 def _load_gateway_config(config_path: Path | None = None) -> dict:
-    """The effective user config.yaml (managed overlay, ``${VAR}`` expansion, model-key canon; no
-    DEFAULT_CONFIG merge) — ``{}`` on any error (fail-open). Defaults to the active gateway home
-    (``_hermes_home`` monkeypatches apply); multiplexers pass a path.
-    """
+    """Effective profile config; enabled manifest errors reach the owning read boundary."""
     if config_path is None:
         config_path = _gateway_config_home() / 'config.yaml'
+    from hermes_cli.config_plugin_defaults import PluginDefaultsError
     try:
         from hermes_cli.config_effective import load_user_config_effective
         return load_user_config_effective(config_path)
+    except PluginDefaultsError:
+        raise
     except Exception:
         logger.debug("Could not load gateway config from %s", config_path, exc_info=True)
         return {}

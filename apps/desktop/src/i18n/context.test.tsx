@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { HermesApiRequest } from '@/global'
 import type { HermesConfigRecord } from '@/hermes'
 
 import { TRANSLATIONS } from './catalog'
@@ -28,9 +29,20 @@ function LanguageProbe({ target = 'zh' }: { target?: Locale }) {
 }
 
 describe('I18nProvider', () => {
+  let hermesDesktopDescriptor: PropertyDescriptor | undefined
+
+  beforeEach(() => {
+    hermesDesktopDescriptor = Object.getOwnPropertyDescriptor(window, 'hermesDesktop')
+  })
+
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    if (hermesDesktopDescriptor) {
+      Object.defineProperty(window, 'hermesDesktop', hermesDesktopDescriptor)
+    } else {
+      Reflect.deleteProperty(window, 'hermesDesktop')
+    }
   })
 
   it('defaults to English without a config client', () => {
@@ -58,6 +70,41 @@ describe('I18nProvider', () => {
 
     await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('en'))
     expect(screen.getByTestId('label').textContent).toBe('Language')
+  })
+
+  it('uses the legacy locale read and submits only the selected language to its source route', async () => {
+    const requests: HermesApiRequest[] = []
+    const api = vi.fn(async (request: HermesApiRequest) => {
+      requests.push(request)
+      return request.method === 'PUT'
+        ? { ok: true }
+        : { display: { language: 'en', skin: 'slate' }, terminal: { cwd: '/new' } }
+    })
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { api }
+    })
+
+    render(
+      <I18nProvider>
+        <LanguageProbe />
+      </I18nProvider>
+    )
+
+    await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
+    expect(requests[0]).toMatchObject({ path: '/api/config?include_defaults=false' })
+    fireEvent.click(screen.getByRole('button', { name: 'switch' }))
+
+    await waitFor(() => expect(requests.some(request => request.method === 'PUT')).toBe(true))
+    const save = requests.find(request => request.method === 'PUT')
+    expect(save).toMatchObject({
+      path: '/api/config?preserve_language=true',
+      body: {
+        config: { display: { language: 'zh' } },
+        write_mode: 'explicit_patch',
+        unset_paths: []
+      }
+    })
   })
 
   it('loads the initial locale from display.language config', async () => {
@@ -201,7 +248,7 @@ describe('I18nProvider', () => {
     }
   })
 
-  it('reads latest config before saving language and preserves unrelated values', async () => {
+  it('reads latest config before saving language and submits only the language edit', async () => {
     const saveConfig = vi.fn().mockResolvedValue({ ok: true })
 
     const latestConfig: HermesConfigRecord = {
@@ -227,10 +274,7 @@ describe('I18nProvider', () => {
     fireEvent.click(screen.getByRole('button', { name: 'switch' }))
 
     await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(1))
-    expect(saveConfig).toHaveBeenCalledWith({
-      display: { language: 'zh', skin: 'slate' },
-      terminal: { cwd: '/new' }
-    })
+    expect(saveConfig).toHaveBeenCalledWith({ display: { language: 'zh' } })
   })
 
   it('applies RTL direction for Arabic and restores LTR on switch back', async () => {

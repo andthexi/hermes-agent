@@ -161,16 +161,20 @@ def _save_aux_choice(task: str, *, provider: str, model: str = "", base_url: str
     cfg = load_config()
     if task == _DELEGATION_TASK_KEY:
         entry = _ensure_dict_section(cfg, "delegation")
+        prefix = ("delegation",)
         provider = "" if provider == "auto" else provider
     else:
         entry = _ensure_dict_section(_ensure_dict_section(cfg, "auxiliary"), task)
+        prefix = ("auxiliary", task)
     entry["provider"] = provider
     entry["model"] = model or ""
     entry["base_url"] = base_url or ""
     entry["api_key"] = api_key or ""
+    fields = {"provider", "model", "base_url", "api_key"}
     if reasoning_effort is not None and _aux_task_takes_reasoning(task):
         entry["reasoning_effort"] = reasoning_effort
-    save_config(cfg)
+        fields.add("reasoning_effort")
+    save_config(cfg, preserve_keys={(*prefix, field) for field in fields})
 
 
 def _aux_task_takes_reasoning(task: str) -> bool:
@@ -197,33 +201,17 @@ def _prompt_aux_reasoning_effort(task: str, current: str) -> Optional[str]:
 
 
 def _reset_aux_to_auto() -> int:
-    """Reset every known aux task (built-in + plugin) back to auto/empty. Returns number reset."""
-    from hermes_cli.config import load_config, save_config
-    from hermes_cli.config_defaults import DEFAULT_CONFIG
-    defaults = DEFAULT_CONFIG.get("auxiliary") or {}
+    """Remove raw auxiliary route overrides so remaining defaults become effective again."""
+    from hermes_cli.config import _unset_nested, read_raw_config, save_config
 
-    def _clear(entry: dict, auto: str, task: str = "") -> bool:
-        # Only the routing fields; timeout/download_timeout (aux) and max_concurrent_children
-        # etc. (delegation) are user-tuned and preserved. *auto* is the reset provider value
-        # ("auto" for aux tasks, "" for delegation); anything else counts as a change.
-        changed = False
-        if entry.get("provider") not in {None, "", auto}:
-            entry["provider"] = auto
-            changed = True
-        for field in ("model", "base_url", "api_key", "reasoning_effort"):
-            # Reset = the shipped default: "" everywhere except a slot that ships one (voice_chat: none).
-            default = str((defaults.get(task) or {}).get(field) or "") if isinstance(defaults.get(task), dict) else ""
-            if (entry.get(field) or entry.get(field) is False or default) and entry.get(field) != default:
-                entry[field] = default
-                changed = True
-        return changed
-
-    cfg = load_config()
-    aux = _ensure_dict_section(cfg, "auxiliary")
-    count = sum(_clear(_ensure_dict_section(aux, task), "auto", task) for task, _name, _desc in _all_aux_tasks())
-    dele = cfg.get("delegation")
-    if isinstance(dele, dict):
-        count += _clear(dele, "")
+    cfg = read_raw_config()
+    prefixes = [("auxiliary", task) for task, _name, _desc in _all_aux_tasks()]
+    prefixes.append(("delegation",))
+    fields = ("provider", "model", "base_url", "api_key", "reasoning_effort")
+    count = 0
+    for prefix in prefixes:
+        for field in fields:
+            count += _unset_nested(cfg, ".".join((*prefix, field)))
     save_config(cfg)
     return count
 

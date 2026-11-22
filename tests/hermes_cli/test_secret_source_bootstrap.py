@@ -197,6 +197,11 @@ def test_real_plugin_source_discovery_applies_dotenv(monkeypatch, tmp_path):
 
     reg._reset_registry_for_tests()
     env_loader.reset_secret_source_cache()
+    from agent.secret_sources.file import FileSource
+    monkeypatch.setattr(
+        FileSource, "fetch",
+        lambda *_args, **_kwargs: pytest.fail("provider registration fetched file secrets"),
+    )
     home = tmp_path / ".hermes"
     plugin_dir = home / "plugins" / "fixture-secret-source"
     plugin_dir.mkdir(parents=True)
@@ -226,7 +231,10 @@ def test_real_plugin_source_discovery_applies_dotenv(monkeypatch, tmp_path):
         "        return FetchResult(secrets={\n"
         "            'HERMES_TEST_PLUGIN_BOOTSTRAP': 'from-plugin',\n"
         "        })\n\n"
+        "from agent.secret_sources.registry import get_source\n"
         "def register(ctx):\n"
+        "    if get_source('file') is None:\n"
+        "        raise RuntimeError('native file source unavailable')\n"
         "    ctx.register_secret_source(FixtureVault())\n",
         encoding="utf-8",
     )

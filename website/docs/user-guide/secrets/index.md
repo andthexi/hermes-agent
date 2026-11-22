@@ -1,12 +1,13 @@
 # Secrets
 
-Hermes can pull API keys from external secret managers at process startup instead of storing them in `~/.hermes/.env`. The bootstrap token for the secret manager lives in `.env`; every other provider key (OpenAI, Anthropic, OpenRouter, etc.) can stay in the manager and rotate centrally.
+Hermes can resolve API keys from external secret sources at process startup instead of storing them in `~/.hermes/.env`. Vendor-manager bootstrap tokens live in `.env`; provider keys can stay in the manager or a private local dotenv file and rotate centrally.
 
 Supported:
 
 - [Bitwarden Secrets Manager](./bitwarden) — `bws` CLI, lazy-installed, free tier works.
 - [1Password](./onepassword) — `op://` references via the official `op` CLI; service-account or desktop session auth.
-- [Command helper](./command) — any CLI vault (`keepassxc-cli`, `secret-tool`, `pass`, custom scripts) via a user-configured helper that prints `KEY=VALUE` lines.
+- [Native dotenv file](./file) — read a private, bounded dotenv file without a shell or network access.
+- [Command helper](./command) — an explicitly user-configured helper that prints `KEY=VALUE` lines.
 
 ## Multiple sources at once
 
@@ -17,6 +18,8 @@ You can enable more than one secret source at the same time — for example a te
 3. **First source wins.** Within the same shape, the order of the optional `secrets.sources` list (or registration order) decides. Later claims on an already-claimed var are skipped — with a startup warning, never silently.
 
 `override_existing` never lets one source overwrite a var another source already claimed, and no source can ever overwrite another source's bootstrap token (e.g. `BWS_ACCESS_TOKEN`).
+
+A plugin may declare non-secret `secrets.file` defaults so a shared dotenv source can be configured once without repeating its path in every profile. This is read-time config only: secret values stay in the external file, never in `plugin.yaml`, config YAML, or credential-pool rows. With `override_existing: false`, each profile's `.env` wins and other shared values are additive. `~/` resolves against the OS user's home, independently of `HERMES_HOME`; relative paths resolve under the owning profile home. The file is still plaintext: keep it owner-readable only (mode 0600 or stricter), outside Git/plugin directories, and back it up separately from a Hermes home. Hermes reads it only during the normal secret-source refresh; there is no watcher or automatic provisioning.
 
 ```yaml
 secrets:
@@ -51,4 +54,4 @@ Terminal commands, `execute_code` sandboxes and [`no_agent` cron scripts](../fea
 
 Third-party secret managers ship as standalone plugins, not core PRs. A backend subclasses `agent.secret_sources.base.SecretSource` (one required method: `fetch(cfg, home_path) -> FetchResult`) and registers via `ctx.register_secret_source(MySource())` in the plugin's `register(ctx)`. The orchestrator owns precedence, conflict handling, timeouts, and provenance — your source only fetches. Full guide with the contract rules, subprocess-safety helper, and conformance kit: [Building a Secret Source Plugin](../../developer-guide/secret-source-plugin.md).
 
-The bundled set is deliberately closed (same policy as memory providers): Bitwarden and 1Password ship in-tree. Everything else — Infisical, Proton Pass, HashiCorp Vault, AWS Secrets Manager, OS keystores — belongs in plugin repos; share them in the Nous Research Discord (`#plugins-skills-and-skins`).
+The bundled set is deliberately closed (same policy as memory providers): Bitwarden and 1Password are the in-tree vendor integrations. The local dotenv-file reader and command helper are generic inputs, not vendor backends. Everything else — Infisical, Proton Pass, HashiCorp Vault, AWS Secrets Manager, OS keystores — belongs in plugin repos; share them in the Nous Research Discord (`#plugins-skills-and-skins`).

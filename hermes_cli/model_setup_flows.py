@@ -251,11 +251,12 @@ def _nous_persist_selection(selected: str, creds: dict) -> dict:
     config (the caller's may carry stale custom-provider fields) and clear a conflicting
     OPENAI_BASE_URL / OPENAI_API_KEY. Returns the saved config."""
     from hermes_cli.auth import _save_model_choice, _update_config_for_provider
-    from hermes_cli.config import get_env_value, load_config, save_config, save_env_value
+    from hermes_cli.config import get_env_value, read_raw_config, save_config, save_env_value
+    from hermes_cli.config_save import explicit_config_paths
     _save_model_choice(selected)
     inference_url = creds.get("base_url", "")
     _update_config_for_provider("nous", inference_url)
-    config = load_config()
+    config = read_raw_config()
     current_model_cfg = config.get("model")
     if isinstance(current_model_cfg, dict):
         model_cfg = dict(current_model_cfg)
@@ -274,7 +275,7 @@ def _nous_persist_selection(selected: str, creds: dict) -> dict:
     if get_env_value("OPENAI_BASE_URL"):
         save_env_value("OPENAI_BASE_URL", "")
         save_env_value("OPENAI_API_KEY", "")
-    save_config(config)
+    save_config(config, preserve_keys=explicit_config_paths({"model": model_cfg}))
     return config
 
 

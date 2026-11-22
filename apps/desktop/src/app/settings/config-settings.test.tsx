@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { atom } from 'nanostores'
 import { createRef } from 'react'
 import { MemoryRouter } from 'react-router'
@@ -27,7 +27,7 @@ vi.mock('@/hermes', async () => ({
   // real one is a pure string fold, mirrored here for the string scopes this
   // suite passes.
   profileScopeKey: (scope?: unknown) => (typeof scope === 'string' && scope.trim()) || 'default',
-  getHermesConfigRecord: (profile?: string) => getHermesConfigRecord(profile),
+  getHermesConfigRecord: (profile?: string, options?: { rawSource?: boolean }) => getHermesConfigRecord(profile, options),
   getHermesConfigSchema: () => getHermesConfigSchema(),
   saveHermesConfig: (config: unknown, profile?: string) => saveHermesConfig(config, profile),
   getElevenLabsVoices: () => getElevenLabsVoices(),
@@ -81,6 +81,17 @@ afterEach(() => {
   vi.clearAllMocks()
 })
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+
+  return { promise, reject, resolve }
+}
+
 function renderConfigSettings(activeSectionId = 'safety') {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const importInputRef = createRef<HTMLInputElement>()
@@ -129,6 +140,115 @@ describe('ConfigSettings autosave', () => {
     }
   })
 
+  it('edits an append_unique list from raw profile entries only', async () => {
+    const effective = { desktop: { repo_scan_roots: ['user-root', 'shared-root'] } }
+    const raw = { desktop: { repo_scan_roots: ['user-root'] } }
+    getHermesConfigRecord.mockImplementation((_profile, options) =>
+      options?.rawSource ? Promise.resolve(raw) : Promise.resolve(effective)
+    )
+    getHermesConfigSchema.mockResolvedValue({
+      fields: { 'desktop.repo_scan_roots': { type: 'list', category: 'workspace', plugin_default: true, merge_mode: 'append_unique' } }
+    })
+
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+
+    try {
+      renderConfigSettings('workspace')
+
+      const field = await screen.findByRole('textbox')
+      expect((field as HTMLInputElement).value).toBe('user-root')
+      fireEvent.focus(field)
+      fireEvent.change(field, { target: { value: 'user-root, another-root' } })
+      fireEvent.blur(field)
+      await vi.advanceTimersByTimeAsync(700)
+
+      await vi.waitFor(() => expect(saveHermesConfig).toHaveBeenCalledTimes(1))
+      expect(saveHermesConfig.mock.calls[0][0]).toEqual({ desktop: { repo_scan_roots: ['user-root', 'another-root'] } })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps append_unique editing unavailable until a failed raw read is retried', async () => {
+    const effective = { desktop: { repo_scan_roots: ['user-root', 'shared-root'] } }
+    const firstRaw = deferred<{ desktop: { repo_scan_roots: string[] } }>()
+    const retriedRaw = deferred<{ desktop: { repo_scan_roots: string[] } }>()
+    let rawAttempts = 0
+    getHermesConfigRecord.mockImplementation((_profile, options) => {
+      if (!options?.rawSource) {
+        return Promise.resolve(effective)
+      }
+      rawAttempts += 1
+      return rawAttempts === 1 ? firstRaw.promise : retriedRaw.promise
+    })
+    getHermesConfigSchema.mockResolvedValue({
+      fields: { 'desktop.repo_scan_roots': { type: 'list', category: 'workspace', plugin_default: true, merge_mode: 'append_unique' } }
+    })
+
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+
+    try {
+      const { importInputRef } = renderConfigSettings('workspace')
+
+      const field = await screen.findByRole('textbox') as HTMLInputElement
+      expect(field.disabled).toBe(true)
+      fireEvent.change(field, { target: { value: 'invented-root' } })
+      fireEvent.blur(field)
+      await vi.advanceTimersByTimeAsync(700)
+      expect(saveHermesConfig).not.toHaveBeenCalled()
+
+      await act(async () => firstRaw.reject(new Error('raw source unavailable')))
+      expect(await screen.findByRole('alert')).toBeTruthy()
+      expect(field.disabled).toBe(true)
+      expect(importInputRef.current?.disabled).toBe(true)
+
+      fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+      await vi.waitFor(() => expect(rawAttempts).toBe(2))
+      await act(async () => retriedRaw.resolve({ desktop: { repo_scan_roots: ['user-root'] } }))
+      await vi.waitFor(() => expect(field.value).toBe('user-root'))
+      expect(field.disabled).toBe(false)
+      expect(importInputRef.current?.disabled).toBe(false)
+
+      fireEvent.focus(field)
+      fireEvent.change(field, { target: { value: 'user-root, another-root' } })
+      fireEvent.blur(field)
+      await vi.advanceTimersByTimeAsync(700)
+      await vi.waitFor(() => expect(saveHermesConfig).toHaveBeenCalledTimes(1))
+      expect(saveHermesConfig.mock.calls[0][0]).toEqual({ desktop: { repo_scan_roots: ['user-root', 'another-root'] } })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('ignores a late raw response from the previous profile', async () => {
+    const alphaRaw = deferred<{ desktop: { repo_scan_roots: string[] } }>()
+    const betaRaw = deferred<{ desktop: { repo_scan_roots: string[] } }>()
+    getHermesConfigRecord.mockImplementation((profile, options) => {
+      if (!options?.rawSource) {
+        return Promise.resolve({ desktop: { repo_scan_roots: [`${profile}-user`, `${profile}-shared`] } })
+      }
+      return profile === 'alpha' ? alphaRaw.promise : betaRaw.promise
+    })
+    getHermesConfigSchema.mockResolvedValue({
+      fields: { 'desktop.repo_scan_roots': { type: 'list', category: 'workspace', plugin_default: true, merge_mode: 'append_unique' } }
+    })
+
+    renderConfigSettings('workspace')
+    const alphaField = await screen.findByRole('textbox') as HTMLInputElement
+    expect(alphaField.disabled).toBe(true)
+
+    await act(async () => scopeProfileMock.set('beta'))
+    await vi.waitFor(() => expect(getHermesConfigRecord).toHaveBeenCalledWith('beta', { rawSource: true }))
+    const betaField = await screen.findByRole('textbox') as HTMLInputElement
+    expect(betaField.disabled).toBe(true)
+
+    await act(async () => alphaRaw.resolve({ desktop: { repo_scan_roots: ['alpha-user'] } }))
+    expect(betaField.disabled).toBe(true)
+    await act(async () => betaRaw.resolve({ desktop: { repo_scan_roots: ['beta-user'] } }))
+    await vi.waitFor(() => expect(betaField.value).toBe('beta-user'))
+    expect(betaField.disabled).toBe(false)
+  })
+
   it('threads the "Applies to" request scope into both the config read and the autosave write', async () => {
     // #118432: the request scope is the concrete profile the page displays
     // (see settings-scope.test.ts). The page must carry it into the read AND
@@ -142,7 +262,8 @@ describe('ConfigSettings autosave', () => {
     try {
       renderConfigSettings()
 
-      await vi.waitFor(() => expect(getHermesConfigRecord).toHaveBeenCalledWith('nash'))
+      await vi.waitFor(() => expect(getHermesConfigRecord).toHaveBeenCalledWith('nash', undefined))
+      expect(getHermesConfigRecord).toHaveBeenCalledWith('nash', { rawSource: true })
 
       ;(await screen.findByRole('switch')).click()
       await vi.advanceTimersByTimeAsync(700)

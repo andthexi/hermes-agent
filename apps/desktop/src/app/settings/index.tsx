@@ -5,7 +5,7 @@ import { Navigate, useLocation, useNavigate } from 'react-router'
 import { codiconIcon } from '@/components/ui/codicon'
 import { KbdCombo } from '@/components/ui/kbd'
 import { Tip } from '@/components/ui/tooltip'
-import { getHermesConfigDefaults, getHermesConfigRecord, saveHermesConfig } from '@/hermes'
+import { getHermesConfigRecord, saveHermesConfig } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import {
@@ -51,6 +51,7 @@ import { deriveBillingView, useBillingState, useSubscriptionState } from './bill
 import { ConfigSettings } from './config-settings'
 import { SECTIONS } from './constants'
 import { GatewaySettings } from './gateway-settings'
+import { explicitConfigPaths } from './helpers'
 import { KeybindSettings } from './keybind-settings'
 import { KEYS_VIEWS, KeysSettings, type KeysView } from './keys-settings'
 import { movedSettingsTabRedirect } from './moved-tabs'
@@ -210,7 +211,7 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
 
   const exportConfig = async () => {
     try {
-      const cfg = await getHermesConfigRecord()
+      const cfg = await getHermesConfigRecord(scopeProfile || undefined, { rawSource: true })
       const blob = new Blob([JSON.stringify(cfg, null, 2)], { type: 'application/json' })
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
@@ -236,7 +237,9 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
     }
 
     try {
-      await saveHermesConfig(await getHermesConfigDefaults())
+      const raw = await getHermesConfigRecord(scopeProfile || undefined, { rawSource: true })
+      const unsetPaths = explicitConfigPaths(raw).filter(path => path !== '_config_version')
+      await saveHermesConfig({}, scopeProfile || undefined, { unsetPaths })
       triggerHaptic('success')
       onConfigSaved?.()
     } catch (err) {

@@ -1,6 +1,6 @@
 # Command Helper Secret Source
 
-Resolve credentials by running your own helper command at startup — any secret store with a CLI works: `keepassxc-cli`, `secret-tool` (GNOME Keyring), `pass`, `gpg`, Vaultwarden's CLI, or a script that cats a tmpfs env file. The helper prints `KEY=VALUE` lines on stdout; Hermes applies them through the same orchestrator as [Bitwarden](./bitwarden) and [1Password](./onepassword), so you can enable any combination of sources simultaneously.
+Resolve credentials by running your own helper command at startup — any secret store with a CLI works: `keepassxc-cli`, `secret-tool` (GNOME Keyring), `pass`, `gpg`, or a purpose-built script. For a static dotenv file, prefer the [native dotenv file source](./file), which needs no shell or subprocess. The command helper prints `KEY=VALUE` lines on stdout; Hermes applies them through the same orchestrator as [Bitwarden](./bitwarden) and [1Password](./onepassword), so you can enable any combination of sources simultaneously.
 
 ## How it works
 

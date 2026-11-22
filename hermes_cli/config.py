@@ -1555,22 +1555,6 @@ def _preserve_env_ref_templates(current, raw, loaded_expanded=None):
     return current
 
 
-def _explicit_config_paths(config: dict[str, Any]) -> set[tuple[str, ...]]:
-    """Leaf paths explicitly present in a RAW (un-normalized) config, so values injected by
-    normalisation are never mistaken for user-set ones. Feeds ``_strip_default_values``."""
-    paths: set[tuple[str, ...]] = set()
-
-    def _walk(value: Any, path: tuple[str, ...]) -> None:
-        if isinstance(value, dict):
-            for key, child in value.items():
-                _walk(child, path + (key,))
-        elif path:
-            paths.add(path)
-
-    _walk(config, ())
-    return paths
-
-
 def _strip_default_values(
     config: dict[str, Any], defaults: dict[str, Any] = DEFAULT_CONFIG,
     preserve_keys: Optional[set[tuple[str, ...]]] = None) -> dict[str, Any]:
@@ -1694,7 +1678,12 @@ def _normalize_max_turns_config(config: dict[str, Any]) -> dict[str, Any]:
     """Move legacy root-level ``max_turns`` under ``agent``; the schema default is injected only
     when the user set max_turns somewhere (so save_config can otherwise omit it)."""
     config = dict(config)
-    agent_config = dict(config.get("agent") or {})
+    raw_agent = config.get("agent", _MISSING)
+    if raw_agent is not _MISSING and raw_agent is not None and not isinstance(raw_agent, dict):
+        return config  # an explicit non-mapping ancestor blocks legacy child injection
+    if raw_agent is None:
+        return config  # explicit null blocks the legacy max_turns alias too
+    agent_config = dict(raw_agent) if isinstance(raw_agent, dict) else {}
     if "max_turns" in config and "max_turns" not in agent_config:
         agent_config["max_turns"] = config["max_turns"]
     if agent_config or "agent" in config:  # a sparse save must not grow an `agent: {}` section
@@ -2000,13 +1989,12 @@ def _ensure_dict(parent: dict[str, Any], key: str) -> dict[str, Any]:
 
 def write_platform_config_field(
     platform_key: str, field_key: str, value: Any, *, raw: bool = False) -> None:
-    """Persist one scalar field under ``platforms.<platform_key>``.
-    ``raw=True`` (CLI setup flows) edits only the user's raw file; dashboard routes use the
-    default loaded-config path to keep their profile-scoped ``load_config`` behavior."""
-    config = read_raw_config() if raw else load_config()
+    """Persist one scalar field under ``platforms.<platform_key>`` without saving merged defaults."""
+    del raw  # retained for callers; every writer must begin from the raw source document
+    config = read_raw_config()
     platforms = _ensure_dict(config, "platforms")
     _ensure_dict(platforms, platform_key)[field_key] = value
-    save_config(config)
+    save_config(config, preserve_keys={("platforms", platform_key, field_key)})
 
 
 # ``terminal.<key>`` -> env var read by tools.terminal_tool. Every key maps to ``TERMINAL_<KEY>``
@@ -2217,124 +2205,93 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
     if snapshot is not None:
         return _deep_merge(copy.deepcopy(DEFAULT_CONFIG), snapshot)
 
-    # Lock-free fast path for cache hits — same publication contract as `_read_raw_config_impl`
-    # above (whole-tuple replace, `_CONFIG_LOCK` only serializes rebuilds and writers). A hit costs
-    # ~0.024ms; behind a lock held by `save_config()` the same read measured 10010ms, and on a
-    # gateway that stalls every inbound message's hook path. A lost race falls through to the lock.
+    from hermes_cli.config_plugin_defaults import (
+        PluginDefaultsError, cached_profile_config, collect_profile_default_layers, compose_user_layer,
+    )
+    managed_bootstrap = managed_scope.load_managed_config() or {}
+    config_path = get_config_path()
+    path_key = str(config_path)
+
+    # A warm effective cache is valid only when its raw profile and winning manifests are current.
+    # The sibling returns only a validated hit; first remote reads stay on the locked load path.
     try:
-        config_path = get_config_path()
-        path_key = str(config_path)
-        if path_key in _LOAD_CONFIG_CACHE:
-            _, fast_sig = _load_config_cache_sig(config_path)
-            hit = _load_config_cache_hit(path_key, fast_sig)
-            if hit is not None:
-                return copy.deepcopy(hit) if want_deepcopy else hit
-    except Exception:
-        # Any surprise here falls through to the locked path, which is the
-        # original fully-defensive implementation.
+        hit = cached_profile_config(
+            path_key, config_path, get_hermes_home(), managed_bootstrap, want_deepcopy=want_deepcopy,
+        )
+        if hit is not None:
+            return hit
+    except PluginDefaultsError:
+        raise
+    except Exception:  # health: allow BLE001 -- cache probes fall through to the locked source read
         pass
 
     with _CONFIG_LOCK:
         ensure_hermes_home()
         config_path = get_config_path()
         path_key = str(config_path)
-
-        user_sig, cache_sig = _load_config_cache_sig(config_path)
-
-        hit = _load_config_cache_hit(path_key, cache_sig)
-        if hit is not None:
-            return copy.deepcopy(hit) if want_deepcopy else hit
-
+        user_sig, base_cache_sig = _load_config_cache_sig(config_path)
+        raw_bootstrap = {} if user_sig is None else _raw_config_cache_hit(path_key, user_sig)
         config = copy.deepcopy(DEFAULT_CONFIG)
 
-        if user_sig is not None:
-            try:
-                user_config = read_config_doc(config_path) or {}
-                _CONFIG_PARSE_FAILURES.pop(path_key, None)  # the file reads now (a transient error left the record)
+        try:
+            if user_sig is not None and raw_bootstrap is None:
+                raw_bootstrap = read_config_doc(config_path) or {}
+                if not isinstance(raw_bootstrap, dict):
+                    raise TypeError(f"top-level YAML must be a mapping, got {type(raw_bootstrap).__name__}")
+                _raw_config_cache_store(path_key, user_sig, copy.deepcopy(raw_bootstrap))
+            user_config = copy.deepcopy(raw_bootstrap or {})
+            layers, plugin_signature = collect_profile_default_layers(
+                get_hermes_home(), user_config, managed_bootstrap)
+            cache_sig = (*base_cache_sig, plugin_signature) if base_cache_sig is not None else None
+            hit = _load_config_cache_hit(path_key, cache_sig)
+            if hit is not None:
+                return copy.deepcopy(hit) if want_deepcopy else hit
 
-                if "max_turns" in user_config:
-                    agent_user_config = dict(user_config.get("agent") or {})
-                    if agent_user_config.get("max_turns") is None:
-                        agent_user_config["max_turns"] = user_config["max_turns"]
-                    user_config["agent"] = agent_user_config
-                    user_config.pop("max_turns", None)
+            if user_sig is not None:
+                _CONFIG_PARSE_FAILURES.pop(path_key, None)  # a successful parse clears a transient failure
+            if "max_turns" in user_config:
+                agent_user_config = dict(user_config.get("agent") or {})
+                if agent_user_config.get("max_turns") is None:
+                    agent_user_config["max_turns"] = user_config["max_turns"]
+                user_config["agent"] = agent_user_config
+                user_config.pop("max_turns", None)
 
-                config = _deep_merge(config, user_config)
-                from hermes_cli.moa_config import apply_user_moa_presets
-                apply_user_moa_presets(config, user_config)
-                # A copy of the file that just parsed is what a FRESH process falls back to when the
-                # next edit breaks the YAML (see _last_known_good_fallback). backup_config() skips
-                # byte-identical repeats and keeps a bounded count, so steady-state loads cost one stat.
+            normalized_user = _normalize_root_model_keys(user_config)
+            plugin_user = compose_user_layer(normalized_user, layers)
+            config = _deep_merge(config, plugin_user)
+            from hermes_cli.moa_config import apply_user_moa_presets
+            apply_user_moa_presets(config, user_config)
+            if user_sig is not None:
+                # A copy of the raw source is what a fresh process can restore after a later edit breaks YAML.
                 from hermes_cli.config_backups import backup_config
                 backup_config(config_path, "good")
-            except Exception as e:
-                lkg_copy = _last_known_good_fallback(config_path, path_key, cache_sig, e)
-                if lkg_copy is not None:
-                    return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
-                # Defaults stand in for the unreadable file: never the next last-known-good,
-                # never saveable, and cached like the LKG path.
-                fallback = FailedConfigRead(
-                    _merge_managed_overlay(_expand_env_vars(_canonicalize_config(config)))[0], error=e)
-                if cache_sig is not None:
-                    _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, fallback, {})
-                return copy.deepcopy(fallback) if want_deepcopy else fallback
+        except PluginDefaultsError:
+            raise
+        except Exception as exc:  # health: allow BLE001 -- config parse/backend errors go through last-good recovery
+            lkg_copy = _last_known_good_fallback(config_path, path_key, base_cache_sig, exc)
+            if lkg_copy is not None:
+                return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
+            fallback = FailedConfigRead(
+                _merge_managed_overlay(_expand_env_vars(_canonicalize_config(config)))[0], error=exc)
+            if base_cache_sig is not None:
+                _LOAD_CONFIG_CACHE[path_key] = (*base_cache_sig, fallback, {})
+            return copy.deepcopy(fallback) if want_deepcopy else fallback
 
         normalized = _canonicalize_config(config)
         expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized))
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         _note_policy("note_config_policy", (expanded.get("security") or {}).get("redact_secrets"))
         if cache_sig is not None:
-            # The cache stores its own deepcopy so load_config() callers can mutate freely while
-            # load_config_readonly() callers all see the same stable object. The env snapshot
-            # records the values this expansion was made against so later loads detect drift.
             cached_copy = copy.deepcopy(expanded)
             env_snapshot = _env_ref_snapshot(normalized)
             if managed_config:
                 _env_ref_snapshot(managed_config, env_snapshot)
             _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, cached_copy, env_snapshot)
-            # Readonly path returns the same object later calls will see (identity invariant).
             if not want_deepcopy:
                 return cached_copy
         else:
             _LOAD_CONFIG_CACHE.pop(path_key, None)
-        # First-load result is a fresh dict (not aliased to the cache); safe to return directly.
         return expanded
-
-
-_SECURITY_COMMENT = """
-# ── Security ──────────────────────────────────────────────────────────
-# Secret redaction is ON by default — strings that look like API keys,
-# tokens, and passwords are masked in tool output, logs, and chat
-# responses before the model or user ever sees them. Set redact_secrets
-# to false to disable (e.g. when developing the redactor itself).
-#
-# security:
-#   redact_secrets: true
-"""
-
-_FALLBACK_COMMENT = """
-# ── Fallback Model ────────────────────────────────────────────────────
-# Automatic provider failover when primary is unavailable.
-# Uncomment and configure to enable. Triggers on rate limits (429),
-# overload (529), service errors (503), or connection failures.
-#
-# Supported providers:
-#   openrouter   (OPENROUTER_API_KEY)  — routes to any model
-#   openai-codex (OAuth — hermes auth) — OpenAI Codex
-#   nous         (OAuth — hermes auth) — Nous Portal
-#   zai          (ZAI_API_KEY)         — Z.AI / GLM
-#   kimi-coding  (KIMI_API_KEY)        — Kimi / Moonshot
-#   kimi-coding-cn (KIMI_CN_API_KEY)   — Kimi / Moonshot (China)
-#   minimax      (MINIMAX_API_KEY)     — MiniMax
-#   minimax-cn   (MINIMAX_CN_API_KEY)  — MiniMax (China)
-#   bedrock      (AWS IAM / boto3)     — AWS Bedrock (Converse API)
-#
-# For custom OpenAI-compatible endpoints, add base_url and key_env.
-#
-# fallback_model:
-#   provider: openrouter
-#   model: anthropic/claude-sonnet-4
-"""
 
 
 def _strip_managed_keys_for_save(config: dict[str, Any]) -> dict[str, Any]:
@@ -2349,18 +2306,6 @@ def _strip_managed_keys_for_save(config: dict[str, Any]) -> dict[str, Any]:
             f"Note: {len(_stripped)} managed setting(s) were not saved "
             f"(managed by your administrator): {', '.join(sorted(_stripped))}", file=sys.stderr)
     return config
-
-
-def _commented_sections_for_save(normalized: dict[str, Any]) -> Optional[str]:
-    """Commented-out example blocks for features that are off/unconfigured."""
-    parts = []
-    if (normalized.get("security") or {}).get("redact_secrets") is None:
-        parts.append(_SECURITY_COMMENT)
-    fb = normalized.get("fallback_model", {})
-    fb_entries = fb if isinstance(fb, list) else [fb]
-    if not any(isinstance(e, dict) and e.get("provider") and e.get("model") for e in fb_entries):
-        parts.append(_FALLBACK_COMMENT)
-    return "".join(parts) or None
 
 
 def save_config(
@@ -2391,7 +2336,14 @@ def save_config(
         from hermes_cli.config_worker_save import rebase_for_save  # frozen-worker writes + merge_existing
         config = rebase_for_save(config, _raw_for_paths, merge_existing)
 
-        normalized = current_normalized = _canonicalize_config(config)
+        normalized = _canonicalize_config(config)
+        from hermes_cli.config_save import restore_unedited_plugin_defaults
+        if _worker_config_snapshot() is None:
+            normalized = restore_unedited_plugin_defaults(
+                normalized, _raw_for_paths, set(preserve_keys or ()), home=get_hermes_home(),
+                managed=managed_scope.load_managed_config() or {},
+            )
+        current_normalized = normalized
         if _raw_for_paths:
             normalized = _preserve_env_ref_templates(
                 normalized, _canonicalize_config(_raw_for_paths),
@@ -2399,11 +2351,13 @@ def save_config(
 
         if strip_defaults:
             # ``_strip_default_values`` always preserves ``_config_version`` itself.
-            effective_preserve_keys = _explicit_config_paths(_raw_for_paths) | set(preserve_keys or ())
+            from hermes_cli.config_save import explicit_config_paths
+            effective_preserve_keys = explicit_config_paths(_raw_for_paths) | set(preserve_keys or ())
             normalized = _strip_default_values(normalized, DEFAULT_CONFIG, preserve_keys=effective_preserve_keys)
 
         note_first_stamp(config_path.parent, _raw_for_paths, normalized)
-        atomic_config_replace(config_path, normalized, extra_content_on_create=_commented_sections_for_save(normalized))
+        from hermes_cli.config_save import commented_sections_for_save
+        atomic_config_replace(config_path, normalized, extra_content_on_create=commented_sections_for_save(normalized))
         _secure_file(config_path)
         _RAW_CONFIG_CACHE.pop(str(config_path), None)
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)

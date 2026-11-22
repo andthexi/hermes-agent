@@ -6,10 +6,10 @@ description: "How to build a secret-manager backend plugin for Hermes Agent"
 
 # Building a Secret Source Plugin
 
-Secret sources resolve provider credentials from an external secret manager (a vault, a password manager, an OS keystore, a custom script) into environment variables at process startup — after `~/.hermes/.env` loads, before Hermes reads credentials. Bitwarden, 1Password, and a generic command-helper source ship in-tree; **every other backend is a plugin**. This guide covers building one.
+Secret sources resolve credentials into environment variables at process startup — after `~/.hermes/.env` loads, before Hermes reads credentials. Bitwarden and 1Password are the in-tree vendor integrations. The generic native dotenv-file reader and command helper are local-input primitives, not vendor backends; third-party secret managers remain plugins. This guide covers building a vendor-backed plugin.
 
 :::tip
-The bundled set is deliberately closed, same policy as [memory providers](./memory-provider-plugin.md): PRs adding new vault backends under `agent/secret_sources/` are closed with a pointer to this guide. Publish your backend as a standalone plugin repo and share it in the Nous Research Discord (`#plugins-skills-and-skins`).
+The vendor-backend set is deliberately closed, same policy as [memory providers](./memory-provider-plugin.md): PRs adding another vendor integration under `agent/secret_sources/` are closed with a pointer to this guide. Generic local inputs such as the native [dotenv file source](../user-guide/secrets/file.md) are not third-party backends. Publish a vendor backend as a standalone plugin repo and share it in the Nous Research Discord (`#plugins-skills-and-skins`).
 :::
 
 ## First-process bootstrap timing
@@ -53,6 +53,22 @@ The orchestrator (`agent.secret_sources.registry.apply_all`) owns everything sec
 ├── plugin.yaml      # name, description
 └── __init__.py      # SecretSource subclass + register(ctx)
 ```
+
+## Checking for a built-in source
+
+A plugin may need a core source capability while registering (for example, a plugin can declare defaults for `secrets.file`). Use the narrow supported lookup `agent.secret_sources.registry:get_source`:
+
+```python
+from agent.secret_sources.registry import get_source
+
+
+def register(ctx):
+    if get_source("file") is None:
+        raise RuntimeError("This plugin requires Hermes native file secret-source support")
+    ctx.register_model_provider(MyProvider())
+```
+
+Its signature is `get_source(name: str, *, scope: Optional[str] = None) -> Optional[SecretSource]`. When `scope` is omitted the current profile-bound registry is used. The lookup may lazily register the built-in source classes, but it never calls `fetch()` or reads secret values; registration must stay data-only. This accessor is intentionally limited to availability/introspection; plugins must not invoke another source's `fetch()`.
 
 ## The SecretSource ABC
 
@@ -126,7 +142,7 @@ class MyVaultSource(SecretSource):
 | Method | Default | Override when |
 |---|---|---|
 | `is_enabled(cfg)` | `cfg.get("enabled")` | Custom activation logic |
-| `override_existing(cfg)` | `cfg.get("override_existing", False)` | You want a different default (both bundled sources default `True` for rotation) |
+| `override_existing(cfg)` | `cfg.get("override_existing", False)` | You want a different default (Bitwarden/1Password default `True` for rotation; local command/file sources default `False`) |
 | `protected_env_vars(cfg)` | empty | You have a bootstrap token (you almost certainly do) |
 | `fetch_timeout_seconds(cfg)` | 120s | Your backend needs a different budget |
 | `config_schema()` | `{}` | Declare config keys for setup surfaces |
