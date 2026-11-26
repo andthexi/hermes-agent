@@ -106,6 +106,11 @@ def _publish_tool_snapshot(
             held = _frozen_tool_names(prefix_registered) if frozen else frozenset()
             new_defs, new_names = _merge_preserving_prefix(current_defs, new_defs, prefix_registered, held)
         new_defs, new_names = _drop_session_tools(agent, new_defs, new_names)
+        from agent.delegation_launch import narrow_tool_surface
+        retained_names = narrow_tool_surface(agent, new_defs)
+        if retained_names is not None:
+            new_names = retained_names
+            staged_engine_names.intersection_update(retained_names)
         # Record the generation (the one read BEFORE the build: a registration that landed during it may
         # be missing from these definitions) and selection even when unchanged, so an in-flight older
         # caller can't clobber.
@@ -114,14 +119,25 @@ def _publish_tool_snapshot(
         # Same name set: nothing to publish, unless the caller is content_aware
         # (explicit reload, compaction) and the serialized schema bytes moved.
         if new_names == current and not (content_aware and _tool_defs_content_changed(agent, new_defs)):
+            # Exact-grant routing names are part of the same surface invariant even when
+            # schemas/names are unchanged; stale generations returned above without mutation.
+            engine_names = getattr(agent, "_context_engine_tool_names", None)
+            if retained_names is not None and isinstance(engine_names, set):
+                engine_names.intersection_update(new_names)
+                engine_names.update(staged_engine_names)
             return None
         agent.tools = new_defs
         agent.valid_tool_names = new_names
         # Publish context-engine routing names atomically with the snapshot.
         engine_names = getattr(agent, "_context_engine_tool_names", None)
         if isinstance(engine_names, set):
-            engine_names.clear()
-            engine_names.update(staged_engine_names)
+            if retained_names is None:
+                engine_names.clear()
+                engine_names.update(staged_engine_names)
+            else:
+                engine_names.intersection_update(new_names)
+                engine_names.update(staged_engine_names)
+        new_names = set(agent.valid_tool_names)
         return new_names - current
 
 
@@ -158,12 +174,24 @@ def refresh_agent_mcp_tools(
     snapshot_generation = registry._generation
     from agent.delegation_backends import adopt_built_backend, saved_backend
     built_backend = saved_backend()
-    new_defs = agent_tool_surface(agent, list(
-        get_tool_definitions(enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=quiet_mode) or []))
+    from agent.delegation_launch import effective_tool_ceiling, exact_tool_surface
+    ceiling = effective_tool_ceiling(agent)
+    if ceiling is None:
+        raw_defs = get_tool_definitions(enabled_toolsets=enabled, disabled_toolsets=disabled,
+                                        quiet_mode=quiet_mode) or []
+    else:
+        raw_defs = get_tool_definitions(enabled_toolsets=enabled, disabled_toolsets=disabled,
+                                        quiet_mode=True, skip_tool_search_assembly=True,
+                                        update_last_resolved_tool_names=False) or []
+    new_defs = agent_tool_surface(agent, list(raw_defs))
     new_names = {_def_name(t) for t in new_defs}
     # Post-build families re-appended on LOCALS only; live attributes untouched until publish.
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
     _reinject_authorized_dynamic_tools(agent, new_defs, new_names)
+    if ceiling is not None:
+        new_defs[:] = agent_tool_surface(agent, exact_tool_surface(agent, new_defs) or [])
+        new_names = {_def_name(item) for item in new_defs}
+        staged_engine_names.intersection_update(new_names)
     # Registry membership is read OUTSIDE ``_agent_tools_lock``: taking ``registry._lock``
     # under the tools lock would be the first nesting of the two.
     prefix_registered: Optional[set] = None
@@ -354,11 +382,18 @@ def restore_agent_tool_prefix(agent, saved) -> bool:
     merged_names = {_def_name(t) for t in merged}
     _reinject_authorized_dynamic_tools(agent, merged, merged_names)
     merged, merged_names = _drop_session_tools(agent, merged, merged_names)
+    from agent.delegation_launch import narrow_tool_surface
+    retained_names = narrow_tool_surface(agent, merged)
+    if retained_names is not None:
+        merged_names = retained_names
     changed = merged != fresh_defs
-    if changed:
-        with _agent_tools_lock:
+    with _agent_tools_lock:
+        if changed:
             agent.tools = merged
             agent.valid_tool_names = merged_names
+        context_names = getattr(agent, "_context_engine_tool_names", None)
+        if isinstance(context_names, set) and retained_names is not None:
+            context_names.intersection_update(merged_names)
     if isinstance(saved, dict) and saved.get("delegation_backend"):
         from agent.delegation_backends import adopt_built_backend
         adopt_built_backend(agent, pinned, saved["delegation_backend"])

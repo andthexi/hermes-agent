@@ -77,9 +77,7 @@ def _tier_in_effect(child: Any) -> Any:
 
 
 def _route_report(child: Any) -> Optional[dict[str, Any]]:
-    """What a backend-routed child actually ran on: its backend and label plus the provider, model, reasoning effort
-    (None = the provider's default) and speed tier read off the child when its result is assembled, so a fallback
-    provider that took over shows (``fallback_activated``). None for the default backend's unlabelled route."""
+    """What a child actually ran on, including sanitized task-local diagnostics."""
     route = getattr(child, "_delegate_route", None)
     if not isinstance(route, dict):
         return None
@@ -88,10 +86,26 @@ def _route_report(child: Any) -> Optional[dict[str, Any]]:
     effort = None
     if isinstance(reasoning, dict):
         effort = reasoning.get("effort") if reasoning.get("enabled", True) else "none"
-    return {**route, "provider": _str_or_none(getattr(child, "provider", None)),
-            "model": _str_or_none(getattr(child, "model", None)), "reasoning_effort": _str_or_none(effort),
-            "service_tier": service_tier_word(_tier_in_effect(child)),
-            **({"fallback_activated": True} if getattr(child, "_fallback_activated", False) is True else {})}
+    report = {**route, "provider": _str_or_none(getattr(child, "provider", None)),
+              "model": _str_or_none(getattr(child, "model", None)), "reasoning_effort": _str_or_none(effort),
+              "service_tier": service_tier_word(_tier_in_effect(child)),
+              **({"fallback_activated": True} if getattr(child, "_fallback_activated", False) is True else {})}
+    diagnostics = getattr(child, "_delegate_route_diagnostics", None)
+    if isinstance(diagnostics, dict) and diagnostics:
+        diagnostic_values = diagnostics
+    elif (
+        isinstance(diagnostics, tuple) and diagnostics
+        and all(isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str) for item in diagnostics)
+    ):
+        diagnostic_values = dict(diagnostics)
+    else:
+        diagnostic_values = None
+    if diagnostic_values is not None:
+        report["validation"] = diagnostic_values.get("validation", "unverified")
+        if diagnostic_values.get("warning"):
+            from tools.delegation_redaction import redact_child_text
+            report["diagnostic"] = redact_child_text(str(diagnostic_values["warning"]))[:1000]
+    return report
 
 def _fabricated_entry(idx: int, status: str, error: str, child: Any, duration: float = 0) -> dict[str, Any]:
     """Result entry for a child that raised, never finished, or was abandoned."""

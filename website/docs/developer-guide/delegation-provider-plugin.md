@@ -93,7 +93,7 @@ is the default route, and `self.settings(config)` is your backend's own block,
 |---|---|---|
 | `name` | yes | The `delegation.backend` value. `default` belongs to the bundled default strategy. |
 | `route_task(task, config)` | yes | Return the route dict for one task. `task` carries `goal`, `context`, `index` and the values the model supplied for your parameters. Raise `DelegationRouteError` to refuse; its message is the tool error the model reads. |
-| `task_parameters(config)` | no | `{name: json_schema}` merged into `tasks.items.properties`. Core enforces `enum` before `route_task` runs and refuses core-owned names (`goal`, `context`, `index`, `output_schema`, `images`, `group`, `role`, `toolsets`, `provider`, `model`, `base_url`, `api_key`, `api_mode`, `acp_command`, `acp_args`). |
+| `task_parameters(config)` | no | `{name: json_schema}` merged into `tasks.items.properties`. Core enforces `enum` before `route_task` runs and refuses core-owned names (`goal`, `context`, `index`, `output_schema`, `images`, `group`, `role`, `toolsets`, `profile`, `model`, `provider`, `reasoning_effort`, `system_prompt`, `system_prompt_mode`, `tools`, `skills`, `base_url`, `api_key`, `api_mode`, `acp_command`, `acp_args`). A backend schema that collides with a core-owned field name/meaning is incompatible and must be surfaced as such, not silently reinterpreted. |
 | `description(config)` | no | Guidance appended to the `delegate_task` description. |
 | `is_available()` | no | No network calls. `False` fails delegation closed while your backend is selected: `delegate_task` returns a tool error naming it and the fix (`/delegation default`, or `hermes config set delegation.backend default`); it never switches to `default` on its own. |
 | `settings(config)` | inherited | `delegation.backends.<name>` as a mapping (empty when unset). Do not override. |
@@ -128,6 +128,33 @@ Unknown keys are dropped. On a profile route, `service_tier` and `reasoning_effo
 
 A non-profile route without `fallback_providers` of its own gets `delegation.fallback_providers`; return
 `"fallback_providers": []` to disable fallback for a route. A profile route keeps its profile's chain.
+
+### Core-owned per-task overrides (approved contract)
+
+The approved contract adds `profile`, `model`, `provider`, `reasoning_effort`, `system_prompt`,
+`system_prompt_mode`, exact tool-name `tools`, and preloaded skill-ID `skills` to each `tasks[]`
+object. This is a launch-local contract; this draft is not a claim that a current release implements
+or accepts it. Global `delegation.model` / `delegation.provider` remain configured child defaults.
+
+Without an override, keep the backend's existing route and fallback behavior. Explicit profile/model/
+provider values take precedence over the backend route and disable model/provider fallback for that
+task, but never bypass backend availability, operator authorization, managed-worker restrictions, or
+permission policy. A model-only choice keeps the baseline provider; a provider-only choice resolves
+the selected profile's saved default model/alias first and refuses if none exists. An explicitly
+selected provider takes priority over an alias's provider. Known model/provider mismatches refuse;
+inconclusive catalog evidence is reported as unverified before attempting the exact pair. The eight
+fields do not add top-level route parameters or expose endpoint/credential overrides.
+
+Core validates ordinary option/route errors per task, reports sanitized task-indexed refusals, and
+allows valid siblings to run. An incompatible backend declaration that collides with a core-owned
+schema is different: the backend is rejected before routing and the whole call is refused until the
+declaration is corrected. Explicit reasoning must survive request construction and recovery unchanged
+or be refused; an unsupported external transport cannot claim a control it cannot enforce.
+Persona replacement changes identity only, not runtime/tool/workspace/depth/output contracts. Explicit
+skills resolve in the selected profile without installation or inline-shell preprocessing. Exact tools
+are enforced at runtime, including helper/deferred/RPC paths; an empty selection means no tools and
+must never broaden to an unrestricted set. This permission boundary is not an OS sandbox. The
+implementation and parent-owned acceptance must be checked before treating these contracts as shipped.
 
 ### Refusals are per task
 

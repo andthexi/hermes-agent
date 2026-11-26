@@ -290,9 +290,51 @@ delegation:
   provider: "openrouter"             # optional: route children to a different provider
 ```
 
-Resolution order: `delegation.base_url` (direct endpoint) takes precedence, then `delegation.provider` (full credential bundle resolved via the runtime provider system), and when neither is set children inherit the parent's provider and credentials; `delegation.model` applies in all cases, and when it is empty children inherit the parent's model. Setting `delegation.provider` alongside `delegation.base_url` keeps the explicit endpoint but carries that provider's request overrides and max output tokens into the child. An explicit `delegation.request_overrides` dict is honored on every branch and merges over those runtime-derived values (see [Configuration](#configuration) below).
+Resolution order: `delegation.base_url` (direct endpoint) takes precedence, then `delegation.provider` (full credential bundle resolved via the runtime provider system), and when neither is set children inherit the parent's provider and credentials; `delegation.model` supplies the configured child-model baseline, and when it is empty children inherit the parent's model. Explicit per-task profile/model/provider fields described below take precedence for that task. Setting `delegation.provider` alongside `delegation.base_url` keeps the explicit endpoint but carries that provider's request overrides and max output tokens into the child. An explicit `delegation.request_overrides` dict is honored on every branch and merges over those runtime-derived values (see [Configuration](#configuration) below).
 
-Note that the pin is global: with the default strategy `delegate_task` has no per-task model parameter, so every child in a batch runs on the configured delegation model. For quality-sensitive subtasks that need a stronger model, either leave `delegation.model` unset for that session, use a delegation strategy plugin (below), or hand the task to the [kanban board](kanban.md#per-task-model-override), which does support a per-task model override.
+`delegation.model` and `delegation.provider` remain profile-wide child defaults; they are not per-call settings. The approved per-task contract below adds launch-local choices on individual `tasks[]` entries. Availability depends on a release containing that implementation; this draft does not assert that a current installation supports it.
+
+### Per-task launch options (approved contract)
+
+These options belong inside each object in `tasks[]`, not at the top level of `delegate_task`. They do not save config, change the parent's model/profile, or add per-task endpoint or credential fields. With no overrides, the active backend keeps its existing route and fallback behavior. The global `delegation.model` / `delegation.provider` settings remain useful defaults for every child.
+
+| Task field | Behavior |
+|---|---|
+| `profile` | Run from this existing Hermes profile's route and runtime baseline. |
+| `model` | Select an exact model ID or configured alias; invalid identifiers are not repaired. |
+| `provider` | Select an existing provider, using credentials configured for the selected profile. |
+| `reasoning_effort` | Request an exact supported effort, including `none`; a known unsupported value is refused, never silently changed. |
+| `system_prompt` | Supply specialist instructions separately from `goal` and `context`. |
+| `system_prompt_mode` | `replace` or `append`; supplying `system_prompt` defaults to `replace`. |
+| `tools` | Select exact tool names, not toolsets. Omitted inherits the existing child grant; `[]` selects no tools. |
+| `skills` | Preload exact skill IDs from the child profile before execution. |
+
+Routing rules:
+
+- Explicit `profile`, `model`, or `provider` takes precedence over backend route choices and disables model/provider fallback for that task. Same-provider retries and credential refresh remain possible. Reasoning, prompt, tools, or skills alone do not change fallback policy.
+- A model-only selection keeps the baseline provider. A provider-only selection uses the selected profile's saved default model, resolved from aliases first; if no saved default exists, the task is refused. An explicitly selected provider takes precedence over a model alias's provider, and uses its own endpoint and credentials.
+- An explicit route is validated against known provider/model information. A known mismatch is refused; inconclusive catalog information is reported as `unverified` and the exact selection is attempted. Catalog recognition does not promise access, quota, connectivity, or successful inference.
+- Ordinary task-local errors—unsupported or unavailable route choices, invalid fields or values, parameters the session's backend does not declare, and unsupported transport controls—refuse only the affected task; valid batch siblings may still run. An incompatible backend declaration that conflicts with a core-owned task-field schema or meaning is call-wide: `delegate_task` refuses the whole call before backend routing, so no task starts until the declaration is corrected or a compatible backend is selected. Explicit reasoning must not be clamped, replaced, or omitted on any supported request path. If a transport cannot enforce a requested override, it must refuse it.
+- Prompt `replace` replaces only the default or selected-profile identity. It does not remove Hermes tool/runtime guidance, workspace instructions, task background, depth limits, or output/completion contracts. `append` keeps the identity and adds the supplied text. Prompt and selected skill contents stay fixed for that child's conversation, including compression; parent prompt and tool schemas do not change.
+- Explicit skills use the child profile's normal lookup and policy. Missing, disabled, ambiguous, unreadable, or unrenderable skills refuse the task; Hermes does not install them automatically or run inline-shell preprocessing during preload.
+- Explicit tools are enforced permissions, not merely a model-visible schema filter. Names outside the parent's effective grant, child-profile restrictions, or existing delegation restrictions are refused rather than silently removed. Nested children cannot widen an inherited grant. This is **not OS sandboxing**: granted `terminal` or `execute_code` can permit general shell/Python actions, still subject to existing approval and backend policy.
+
+For example, the fields are per task:
+
+```python
+delegate_task(tasks=[{
+    "goal": "Review the API error handling",
+    "model": "google/gemini-3-flash-preview",
+    "provider": "openrouter",
+    "reasoning_effort": "high",
+    "system_prompt": "Focus on observable failure modes and cite relevant files.",
+    "system_prompt_mode": "append",
+    "tools": ["web_search", "terminal"],
+    "skills": ["arxiv"],
+}])
+```
+
+The active delegation backend and lifecycle remain in control: these task options do not bypass backend/operator refusals, permission policy, managed-worker restrictions, concurrency, completion, or cancellation behavior.
 
 ### Delegation strategies (`delegation.backend`)
 
@@ -373,9 +415,9 @@ Credentials resolve exactly like a `delegation.provider` pin (full runtime-provi
 
 `/review` is deliberately separate from `/refine`: `/refine` reviews the conversation to update memory and skills, `/review` reviews the *work product* the conversation created.
 
-## Inherited Tool Access
+## Inherited and Per-Task Tool Access
 
-`delegate_task` does not accept a model-facing `toolsets` parameter. Each subagent inherits the parent's enabled toolsets so the model cannot grant a child capabilities that the parent does not have. Configure the parent's tools before starting the conversation if delegated work needs additional capabilities.
+`delegate_task` does not accept a model-facing `toolsets` parameter. The approved per-task `tools` option is an exact array of tool names, not toolsets; when omitted, children retain the existing inherited grant. Any explicit selection remains bounded by parent and child policy. These launch options depend on a release containing the implementation and are not asserted as accepted here.
 
 Certain tools are blocked for subagents even when the parent has them:
 - `delegate_task` — blocked for leaf subagents (the default). Retained for `role="orchestrator"` children, bounded by `max_spawn_depth` — see [Depth Limit and Nested Orchestration](#depth-limit-and-nested-orchestration) below.
@@ -384,7 +426,7 @@ Certain tools are blocked for subagents even when the parent has them:
 - `send_message` — no cross-platform side effects
 - `cronjob` — no scheduling more work in the parent's name
 
-Both roles retain `execute_code` (programmatic tool calling) so children can batch mechanical work.
+With inherited tools, both roles retain `execute_code` (programmatic tool calling) so children can batch mechanical work. An explicit exact `tools` grant includes it only when named and allowed by parent/child policy; `tools: []` grants no tools, including `execute_code`.
 
 ## Max Iterations
 
@@ -701,12 +743,12 @@ For **durable execution** that must survive session closure or process restart, 
 ## Key Properties
 
 - Each subagent gets its **own terminal session** (separate from the parent)
-- Subagents inherit the parent's enabled toolsets; the model cannot select or widen them per call
+- Without an explicit per-task `tools` selection, subagents retain the existing inherited tool grant; an explicit list is limited to exact names within parent/child policy
 - **Nested delegation is opt-in** — only `role="orchestrator"` children can delegate further, and only when `max_spawn_depth` is raised from its default of 1 (flat). Disable globally with `orchestrator_enabled: false`.
-- Leaf subagents **cannot** call: `delegate_task`, `clarify`, `memory`, `send_message`, `cronjob`. Orchestrator subagents retain `delegate_task` but keep the other blocks. Both roles retain `execute_code` (programmatic tool calling) so children can batch mechanical work instead of burning reasoning iterations.
+- Leaf subagents **cannot** call: `delegate_task`, `clarify`, `memory`, `send_message`, `cronjob`. Orchestrator subagents retain `delegate_task` but keep the other blocks. With inherited tools, both roles retain `execute_code` (programmatic tool calling); an explicit exact `tools` grant includes it only when named and allowed by parent/child policy (`tools: []` grants no tools).
 - **Cancellation follows ownership** — `/stop` or closing/resetting the owning session ends its background children and the synchronous descendants beneath them; each returns an interrupted completion carrying its partial output
 - Only the final summary enters the parent's context, keeping token usage efficient
-- Subagents inherit the parent's **API key, provider configuration, and credential pool** (enabling key rotation on rate limits)
+- Without route overrides, children retain the existing backend/profile credential-resolution behavior; explicit route pins use the selected profile/provider credentials and disable model/provider fallback for that task
 
 ## Worktree Isolation
 

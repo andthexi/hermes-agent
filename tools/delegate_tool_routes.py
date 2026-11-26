@@ -13,24 +13,23 @@ import contextlib
 import json
 import logging
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 
 from agent.delegation_provider import (
-    RESERVED_TASK_PARAMETERS, ROUTE_KEYS, DelegationProvider, DelegationRouteError,
+    RESERVED_TASK_PARAMETERS, CORE_TASK_OPTION_FIELDS, ROUTE_KEYS, DelegationProvider, DelegationRouteError,
 )
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
 _PARAM_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_FORBIDDEN_RAW_TASK_ROUTE_FIELDS = frozenset({"api_key", "base_url", "api_mode"})
 
 
 @dataclass
 class TaskRoute:
-    """How core builds one child: the credential bundle (with a route's speed tier applied), the config block
-    owning its fallback policy, an optional reasoning override, and the profile home it runs as (None = this one).
-    ``error`` set = the backend could not route this task: it is refused alone and its siblings still run."""
+    """How core builds one child: its route, diagnostics and task-scoped launch policy."""
 
     creds: dict[str, Any]
     routing_cfg: dict[str, Any]
@@ -39,17 +38,29 @@ class TaskRoute:
     label: Optional[str] = None
     backend: str = "default"
     error: Optional[str] = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+    launch_policy: Any = None
 
     def report(self) -> Optional[dict[str, Any]]:
-        """The ``route`` a backend-routed task's result carries (None for the default backend's unlabelled route)."""
-        if self.backend == "default" and not self.label:
+        """Backend label plus route-validation metadata; preserve None for legacy default routes."""
+        if self.backend == "default" and not self.label and not self.diagnostics:
             return None
-        return {"backend": self.backend, **({"label": self.label} if self.label else {})}
+        public_diagnostics = {key: value for key, value in self.diagnostics.items()
+                              if key not in {"reasoning_validation", "reasoning_warning"}}
+        report = {"backend": self.backend, **({"label": self.label} if self.label else {}), **public_diagnostics}
+        if report.get("warning"):
+            from tools.delegation_redaction import redact_child_text
+            report["diagnostic"] = redact_child_text(str(report.pop("warning")))[:1000]
+        return report
 
     def refused_entry(self, index: int) -> dict[str, Any]:
-        """Result entry for a task this route refused: no child was built for it."""
-        return {"task_index": index, "status": "error", "summary": None, "error": self.error, "api_calls": 0,
-                "duration_seconds": 0, "route": {**(self.report() or {"backend": self.backend}), "refused": True}}
+        """Result entry for a refused task; only bounded sanitized route diagnostics escape."""
+        report = self.report()
+        if report and self.diagnostics.get("validation") == "refused":
+            report = {"backend": self.backend, **({"label": self.label} if self.label else {})}
+        entry = {"task_index": index, "status": "error", "summary": None, "error": self.error, "api_calls": 0,
+                 "duration_seconds": 0, "route": {**(report or {"backend": self.backend}), "refused": True}}
+        return entry
 
 
 def _active_provider(config: Mapping[str, Any]) -> DelegationProvider:
@@ -57,25 +68,53 @@ def _active_provider(config: Mapping[str, Any]) -> DelegationProvider:
     return get_active_provider(config)
 
 
-def _declared_parameters(provider: DelegationProvider, config: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
-    """The provider's per-task parameters, minus anything malformed or reserved (warned)."""
+def _provider_task_parameters(provider: DelegationProvider, config: Mapping[str, Any]
+                              ) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Detached provider schemas plus names whose schema conflicts with a core task field."""
     try:
         raw = provider.task_parameters(config)
     except Exception:  # plugin boundary: a broken provider costs its parameters, never the delegate_task tool
         logger.warning("delegation provider %s.task_parameters() raised; no extra parameters", provider.name,
                        exc_info=True)
-        return {}
+        return {}, []
     if not isinstance(raw, Mapping):
-        return {}
+        return {}, []
+
+    from tools.delegate_tool import DELEGATE_TASK_SCHEMA
+
+    core = DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tasks"]["items"]["properties"]
     accepted: dict[str, dict[str, Any]] = {}
+    conflicts = []
     for name, schema in raw.items():
-        if not isinstance(name, str) or not _PARAM_NAME_RE.match(name) or name in RESERVED_TASK_PARAMETERS:
+        if not isinstance(name, str) or not _PARAM_NAME_RE.match(name):
             logger.warning("delegation provider %s: task parameter %r refused (reserved or invalid name)",
                            provider.name, name)
             continue
-        if isinstance(schema, Mapping):
-            accepted[name] = json.loads(json.dumps(schema))  # plain, detached copy
-    return accepted
+        if name in CORE_TASK_OPTION_FIELDS:
+            try:
+                compatible = isinstance(schema, Mapping) and (
+                    json.loads(json.dumps(schema, sort_keys=True)) ==
+                    json.loads(json.dumps(core[name], sort_keys=True)))
+            except (TypeError, ValueError):
+                compatible = False
+            if not compatible:
+                conflicts.append(name)
+                continue
+            # Core owns the meaning and schema already advertises it; never overlay it.
+            continue
+        if name in RESERVED_TASK_PARAMETERS:
+            logger.warning("delegation provider %s: task parameter %r refused (reserved or invalid name)",
+                           provider.name, name)
+            continue
+        if not isinstance(schema, Mapping):
+            continue
+        accepted[name] = json.loads(json.dumps(schema))  # plain, detached copy
+    return accepted, sorted(conflicts)
+
+
+def _declared_parameters(provider: DelegationProvider, config: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Per-task parameters, excluding reserved fields and incompatible core schema collisions."""
+    return _provider_task_parameters(provider, config)[0]
 
 
 def schema_extension(config: Mapping[str, Any]) -> tuple[dict[str, dict[str, Any]], str]:
@@ -85,12 +124,20 @@ def schema_extension(config: Mapping[str, Any]) -> tuple[dict[str, dict[str, Any
         provider = _active_provider(config)
     except DelegationRouteError:
         return {}, ""  # fails closed at spawn time, with the fix; the schema just stays the base one
+    parameters, conflicts = _provider_task_parameters(provider, config)
+    description = ""
+    if conflicts:
+        description = (
+            f"WARNING: incompatible core task parameter declarations from delegation backend '{provider.name}' "
+            f"({', '.join(conflicts)}). These declarations are ignored; the public delegate_task schema remains "
+            "available, but all calls are refused until the backend declaration is corrected or the backend changes.")
     try:
         addendum = provider.description(config)
     except Exception:  # plugin boundary: a broken provider costs its guidance, never the delegate_task tool
         logger.warning("delegation provider %s.description() raised", provider.name, exc_info=True)
         addendum = ""
-    return _declared_parameters(provider, config), addendum.strip() if isinstance(addendum, str) else ""
+    return parameters, "\n".join(text for text in (addendum.strip() if isinstance(addendum, str) else "", description)
+                                   if text)
 
 
 def _param_error(index: int, name: str, value: Any, schema: Mapping[str, Any]) -> Optional[str]:
@@ -265,15 +312,32 @@ def _check_backend_effort(index: int, route: Mapping[str, Any], config: Mapping[
             f"Use none or one of: {', '.join(VALID_REASONING_EFFORTS)}.")
 
 
-def _undeclared_error(provider: DelegationProvider, index: int, names: list[str], config: Mapping[str, Any]) -> str:
+def _unknown_task_keys(task: Mapping[Any, Any], declared: Mapping[str, Any]) -> list[Any]:
+    names = (name for name in task
+             if not isinstance(name, str)
+             or name in _FORBIDDEN_RAW_TASK_ROUTE_FIELDS
+             or name not in declared and name not in RESERVED_TASK_PARAMETERS)
+    return sorted(names, key=lambda name: (not isinstance(name, str), name[:128] if isinstance(name, str) else type(name).__name__))
+
+
+def _unknown_task_key_error(index: int, names: list[Any]) -> str:
+    shown = ", ".join(f"'{name[:128]}'" if isinstance(name, str) else f"<non-string {type(name).__name__} key>"
+                       for name in names[:8])
+    remaining = f" and {len(names) - 8} more" if len(names) > 8 else ""
+    return f"Task {index}: unknown task key(s) {shown}{remaining}; this task was not started."
+
+
+def _undeclared_error(provider: DelegationProvider, index: int, names: list[Any], config: Mapping[str, Any]) -> str:
     """Why a task carrying parameters the session's backend does not declare is refused (a model inventing them, or
     a session whose tools came from another build than its backend); dropping them would run the task on this
     backend's default route. ``/delegation <backend> --now`` or ``/new`` rebuilds the tools and the backend together."""
     from agent.delegation_registry import _registry
     active = provider.name
-    listed = ", ".join(f"'{name}'" for name in names)
+    listed = ", ".join(f"'{name[:128]}'" if isinstance(name, str) else f"<non-string {type(name).__name__} key>"
+                        for name in names[:8])
+    string_names = {name for name in names if isinstance(name, str)}
     owners = sorted({other.name for other in _registry.list_providers() if other.name != active
-                     and set(names) & set(_declared_parameters(other, config))})
+                     and string_names & set(_declared_parameters(other, config))})
     head = f"Task {index}: the delegation backend is '{active}', which does not take {listed}"
     fix = (f"run `/delegation {active} --now` to rebuild this session's delegate_task for '{active}', "
            f"or start a new session with /new")
@@ -281,14 +345,15 @@ def _undeclared_error(provider: DelegationProvider, index: int, names: list[str]
         quoted = ", ".join(f"'{owner}'" for owner in owners)
         return (f"{head} (declared by {quoted}), so this task was not started. This session's delegate_task was "
                 f"built for another backend: {fix}.")
+    if any(not isinstance(name, str) for name in names):
+        return f"{head}, and no installed delegation backend declares these names, so this task was not started."
     return (f"{head}, and no installed delegation backend does, so this task was not started. Resend it without "
             f"{listed}; if this session's delegate_task tool offers {listed}, {fix}.")
 
 
 def _route_one(provider: DelegationProvider, declared: dict[str, dict[str, Any]], index: int,
                task: Mapping[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
-    undeclared = sorted(name for name, value in task.items()
-                        if value is not None and name not in declared and name not in RESERVED_TASK_PARAMETERS)
+    undeclared = _unknown_task_keys(task, declared)
     if undeclared:
         raise DelegationRouteError(_undeclared_error(provider, index, undeclared, config))
     params = {name: task[name] for name in declared if task.get(name) is not None}
@@ -307,7 +372,38 @@ def _route_one(provider: DelegationProvider, declared: dict[str, dict[str, Any]]
 
 
 def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, Any], parent_agent: Any,
-                        ) -> tuple[list[TaskRoute], Optional[str]]:
+                        *, options: Optional[list[Any]] = None, option_errors: Optional[list[Optional[str]]] = None,
+                        base_route: Optional[TaskRoute] = None) -> tuple[list[TaskRoute], Optional[str]]:
+    """Route tasks, then apply validated core task-local route and reasoning options."""
+    from tools.delegate_tool_validation import resolve_task_routes as _apply_task_options
+    options = options if options is not None else []
+    if option_errors is None:
+        from tools.delegate_tool_validation import resolve_task_options
+        options, option_errors = resolve_task_options(task_list)
+    if base_route is not None:
+        routes = [base_route for _ in task_list]
+        declared = dict.fromkeys(CORE_TASK_OPTION_FIELDS)
+    else:
+        declared = None
+        routes, error = _resolve_backend_task_routes(task_list, config, parent_agent)
+        if error:
+            return routes, error
+    if declared is not None:
+        for index, (task, route) in enumerate(zip(task_list, routes)):
+            if route.error:
+                continue
+            unknown = _unknown_task_keys(task, declared)
+            if unknown:
+                error = _unknown_task_key_error(index, unknown)
+                routes[index] = replace(route, error=error, diagnostics={"validation": "refused", "warning": error})
+    if not options:
+        options = [None] * len(task_list)
+    return _apply_task_options(task_list, config, parent_agent, routes, options, option_errors, base_route), None
+
+
+def _resolve_backend_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, Any], parent_agent: Any,
+                                 ) -> tuple[list[TaskRoute], Optional[str]]:
+    """Original backend-only router, kept as the baseline before core option precedence."""
     """One :class:`TaskRoute` per task from the backend the session's ``delegate_task`` was built from (else
     ``delegation.backend``), or ``([], error)`` when that backend cannot run (fails closed, never another backend).
     A task the backend cannot route gets a route with ``error`` set; its siblings are unaffected. Identical routes
@@ -319,7 +415,13 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
         provider = _active_provider(config)
     except DelegationRouteError as exc:
         return [], str(exc)
-    declared = _declared_parameters(provider, config)
+    declared, conflicts = _provider_task_parameters(provider, config)
+    if conflicts:
+        fields = ", ".join(f"'{name}'" for name in conflicts)
+        message = (f"Delegation backend '{provider.name}' has incompatible core task parameter declarations for "
+                   f"{fields}. The delegate_task schema remains available, but this call was refused before backend "
+                   "routing. Correct the provider declaration or switch to a compatible delegation backend.")
+        return [TaskRoute({}, {}, backend=provider.name, error=message) for _ in task_list], None
     cache: dict[str, TaskRoute] = {}
     routes: list[TaskRoute] = []
     for i, task in enumerate(task_list):
@@ -327,13 +429,19 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
             route = _route_one(provider, declared, i, task, config)
             _check_backend_effort(i, route, config)
             routes.append(_route_to_task_route(route, parent_agent, cache, config, provider.name))
-        except ValueError as exc:  # DelegationRouteError, the credential resolver's and the tier check's refusals
-            routes.append(TaskRoute({}, {}, backend=provider.name, error=str(exc)))
+        except (ValueError, DelegationRouteError) as exc:  # each bad task is refused independently
+            routes.append(TaskRoute({}, {}, backend=provider.name, error=str(exc),
+                                    diagnostics={"validation": "refused", "warning": str(exc)}))
     return routes, None
+
+
+def resolve_delegation_credentials(cfg: dict[str, Any], parent_agent: Any) -> dict[str, Any]:
+    """Facade adapter for the explicit internal per-call route owner."""
+    from tools.delegate_tool import _resolve_delegation_credentials
+    return _resolve_delegation_credentials(cfg, parent_agent)
 
 
 def route_for_config(routing_cfg: dict[str, Any], parent_agent: Any) -> TaskRoute:
     """The route an internal caller's explicit config block describes (``/review`` ->
     ``auxiliary.review``); bypasses the provider, as those callers own their route."""
-    from tools.delegate_tool import _resolve_delegation_credentials  # the facade is the patch seam
-    return TaskRoute(_resolve_delegation_credentials(routing_cfg, parent_agent), routing_cfg)
+    return TaskRoute(resolve_delegation_credentials(routing_cfg, parent_agent), routing_cfg)

@@ -263,6 +263,7 @@ class AIAgent(
         event_callback: Optional[Callable[[str, dict], None]] = None,
         reaction_callback: Optional[Callable[[str], None]] = None,
         max_tokens: int | None = None, reasoning_config: dict[str, Any] | None = None, service_tier: str | None = None,
+        strict_reasoning_effort: bool = False, delegation_launch_policy: Any = None,
         request_overrides: dict[str, Any] | None = None, prefill_messages: list[dict[str, Any]] | None = None,
         platform: str | None = None, user_id: str | None = None, user_id_alt: str | None = None, user_name: str | None = None,
         chat_id: str | None = None, chat_name: str | None = None, chat_type: str | None = None, thread_id: str | None = None,

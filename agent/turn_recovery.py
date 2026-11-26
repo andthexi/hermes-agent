@@ -301,7 +301,6 @@ def recover_before_classification(
                 "images stay in the session history.",
             )
             return True, active_system_prompt
-
     # A strict schema rejected a replayed reasoning key BY NAME: record it per (provider, host, model)
     # and retry once; build_api_request re-shapes api_messages without it. An unnamed upstream error
     # never counts, and a key already recorded falls through to normal handling (no loop).
@@ -309,7 +308,6 @@ def recover_before_classification(
     if _status_ok and (_new := record_reasoning_field_rejection(agent, _err_body, _sent or api_messages)):
         _vlines(agent, f"⚠️  {agent.model} rejected replayed {', '.join(sorted(_new))} — retrying without it for this model.")
         return True, active_system_prompt
-
     # AnthropicBedrock SDK raises "Unexpected event order" when Bedrock errors before
     # message_start; fall back to native Converse for this session.
     if (
@@ -651,6 +649,26 @@ def _usage_window_reset_context(agent) -> dict[str, float]:
     return {"reset_at": resets_ms / 1000} if isinstance(resets_ms, (int, float)) and resets_ms > 0 else {}
 
 
+def _recover_reasoning_effort_rejection(agent, _retry, recovered_with_pool):
+    if getattr(agent, "_strict_reasoning_effort", False) is True:
+        requested = getattr(agent, "_strict_requested_reasoning_effort", None)
+        sent = getattr(agent, "_wire_reasoning_config", None)
+        if isinstance(requested, str) and isinstance(sent, dict) and sent.get("effort") == requested:
+            agent._strict_reasoning_effort_rejected = True
+            agent._wire_reasoning_config = None
+            _retry.reasoning_mandatory_retry_visit = route_visit(agent)
+            return False, recovered_with_pool
+
+    _retry.reasoning_mandatory_retry_visit = route_visit(agent)
+    sent = getattr(agent, "_wire_reasoning_config", None)
+    if isinstance(sent, dict) and sent.get("enabled") is not False and sent.get("effort") not in (None, "none"):
+        agent._reasoning_effort_rejected = True
+        _vlines(agent, f"⚠️  {agent.model} rejects reasoning effort {sent['effort']} — using the route's default until the route changes, retrying...")
+        logger.warning("%sReasoning-effort recovery: dropping reasoning config for %s", agent.log_prefix, agent.model)
+        return True, recovered_with_pool
+    return None
+
+
 def recover_after_classification(
     agent: Any, api_error: Exception, classified: Any, _retry: TurnRetryState, *,
     status_code: Optional[int], error_context: Any, messages: list[dict[str, Any]],
@@ -732,27 +750,12 @@ def recover_after_classification(
             "messages with image parts found; surfacing original error."
         )
 
-    # Route rejecting a reasoning disable: a reasoning-mandatory route (Nous Portal / OpenRouter,
-    # e.g. GLM-5.3) 400s on ``reasoning: {enabled: false}``; a chat-only OpenAI-compatible relay
-    # 400s on the ``reasoning_effort: none`` the title/continuation disable projects (#114460).
-    # The catalog guard in the provider profile normally swallows the first, but a process that
-    # warmed its caps cache before the route flipped keeps sending it. One-shot: never send a
-    # disable again on this route (the wire builder omits it → route default), queue a catalog
-    # refresh so the guard is right next time (no-op for providers without a catalog), retry.
     if (
         classified.reason == FailoverReason.reasoning_mandatory
         and _retry.reasoning_mandatory_retry_visit != route_visit(agent)
     ):
-        _retry.reasoning_mandatory_retry_visit = route_visit(agent)
-        sent = getattr(agent, "_wire_reasoning_config", None)
-        if isinstance(sent, dict) and sent.get("enabled") is not False and sent.get("effort") not in (None, "none"):
-            # The rejected request carried an ENABLED config: the route refuses that reasoning
-            # level (#100536: ``reasoning.effort: max`` on a Responses relay). Dropping a disable
-            # would resend the identical request; omit the reasoning fields instead (route default).
-            agent._reasoning_effort_rejected = True
-            _vlines(agent, f"⚠️  {agent.model} rejects reasoning effort {sent['effort']} — using the route's default until the route changes, retrying...")
-            logger.warning("%sReasoning-effort recovery: dropping reasoning config for %s", agent.log_prefix, agent.model)
-            return True, recovered_with_pool
+        if (effort_recovery := _recover_reasoning_effort_rejection(agent, _retry, recovered_with_pool)) is not None:
+            return effort_recovery
         agent._reasoning_disable_rejected = True
         # "Reasoning is mandatory ... cannot be disabled" understands the field and refuses only the
         # OFF: step up to the floor effort (the closest the route allows to what the user asked for)

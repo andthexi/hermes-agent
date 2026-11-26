@@ -121,6 +121,46 @@ The main entry point is `model_tools.get_tool_definitions(enabled_toolsets, disa
 
 Old toolset names with `_tools` suffixes (e.g., `web_tools`, `terminal_tools`) are mapped to their modern tool names via `_LEGACY_TOOLSET_MAP` for backward compatibility.
 
+## Delegated task launch policy (approved contract)
+
+This section documents the approved per-task contract; it does not assert current release availability
+or feature acceptance. Eight optional controls belong on each `tasks[]` object: `profile`, `model`,
+`provider`, `reasoning_effort`, `system_prompt`, `system_prompt_mode`, exact-name `tools`, and
+preloaded `skills`. No top-level per-call route or API credential fields are added. Existing global
+`delegation.model` / `delegation.provider` remain child defaults, and a task without overrides keeps
+the active backend's existing behavior.
+
+An explicit profile/model/provider is a route pin: it takes precedence over backend routing and
+disables model/provider fallback for that task. Model-only uses the baseline provider; provider-only
+uses the selected profile's saved default model (aliases resolved first) and refuses if no default is
+available. Explicit provider wins over an alias provider. Known route mismatches refuse, while
+inconclusive model-catalog checks are labeled `unverified` before the exact route is attempted.
+Reasoning-only and persona/tool/skill-only options do not disable fallback. An explicit reasoning
+effort is strict: if a request builder, recovery path, or transport cannot preserve it exactly, refuse
+the child rather than clamp, omit, or retry with a different effort.
+
+Validate each task before child execution. Return sanitized, task-indexed refusals; valid siblings in
+a batch may proceed. Reject invalid/unknown fields, incompatible backend schema collisions, missing
+profiles/providers/credentials/default models, and requested tools/skills that cannot be granted or
+resolved. Keep existing whole-call checks for malformed batch/output/image structures and preserve
+lifecycle, result delivery, and cancellation behavior.
+
+`system_prompt_mode: replace` replaces only the default/selected-profile identity; `append` retains
+it. Runtime/tool-operation instructions, workspace context, task background, depth and output
+contracts, and plugin operational sections remain. Persona and explicitly preloaded complete skill
+bodies stay frozen for that child's conversation and compression; never install or run inline-shell
+preprocessing during preload. Parent prompt/cache state is unchanged.
+
+An explicit `tools` list is a runtime permission ceiling, not only schema filtering: `None` (omitted)
+means the existing inherited child grant, while `[]` means no tools. Reject names outside the
+parent-effective permission grant, selected-profile restrictions, and existing delegation policy;
+never let nested children widen a grant. Enforce it through discovery/injection/reload/restore,
+compression, sequential/concurrent execution, deferred tool bridges and execute-code RPC. Selection
+uses concrete tool names and does not implicitly grant a tool-search/MCP/RPC registry bridge. This is
+not OS sandboxing: `terminal` and `execute_code` can still allow general shell/Python actions under
+the existing approval/backend policy. If an external transport cannot enforce a requested override,
+refuse that override rather than reporting it as effective.
+
 ## Dispatch
 
 At runtime, tools are dispatched through the central registry, with agent-loop exceptions for some agent-level tools such as memory/todo/session-search handling.

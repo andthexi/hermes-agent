@@ -101,31 +101,22 @@ def run_tool_round(
     # before it is staged (idempotent for already-normalized ids).
     normalize_provider_tool_call_ids(assistant_message.tool_calls)
 
-    # Mixed batch: the assistant message keeps EVERY emitted call (each tool_call needs a
-    # matching result) while only valid ones dispatch.
-    _invalid_batch_calls = [
-        tc for tc in assistant_message.tool_calls if tc.function.name not in agent.valid_tool_names
-    ] if _tvv.mixed_invalid_batch else []
-
+    all_tool_calls = assistant_message.tool_calls
     assistant_msg, duplicate_previous_interim = stage_tool_call_message(
         agent, assistant_message=assistant_message, finish_reason=finish_reason, messages=messages
     )
     append_message(messages, assistant_msg)
+    if _tvv.rejected_tool_results:
+        rejected_results = {id(tc): content for tc, content in _tvv.rejected_tool_results}
+        for tc in all_tool_calls:
+            content = rejected_results.get(id(tc))
+            if content is not None:
+                append_message(messages, {
+                    "role": "tool", "name": tc.function.name,
+                    "tool_call_id": coalesce_tool_call_id(tc), "content": content,
+                })
+        assistant_message.tool_calls = _tvv.runnable_tool_calls or []
 
-    # Mixed batch: error-result invalid calls and drop them from execution.
-    if _invalid_batch_calls:
-        for tc in _invalid_batch_calls:
-            append_message(messages, {
-                "role": "tool",
-                "name": tc.function.name,
-                "tool_call_id": coalesce_tool_call_id(tc),
-                "content": _invalid_tool_name_error_content(
-                    tc.function.name, agent.valid_tool_names
-                ),
-            })
-        assistant_message.tool_calls = [
-            tc for tc in assistant_message.tool_calls if tc.function.name in agent.valid_tool_names
-        ]
 
     # Persist the tool-call turn before any tool side effects so resume sees the executed
     # block if a destructive tool restarts Hermes.

@@ -40,11 +40,63 @@
               },
               "type": "array"
             },
+            "model": {
+              "description": "Exact model ID or configured alias for this task; pins routing and disables model fallback.",
+              "type": "string"
+            },
             "output_schema": {
               "description": "JSON Schema this child's final answer must validate against (told to the child up front; parent validates with one bounded correction retry; result gains schema_valid, plus schema_errors on failure — the child's raw text is still returned as summary, never discarded). Keep it forgiving — require only fields you will read.",
               "properties": {},
               "required": [],
               "type": "object"
+            },
+            "profile": {
+              "description": "Run this task using the selected Hermes profile's saved route and credentials.",
+              "type": "string"
+            },
+            "provider": {
+              "description": "Provider identity for this task; uses the selected baseline profile's saved default model if model is omitted.",
+              "type": "string"
+            },
+            "reasoning_effort": {
+              "description": "Exact Hermes reasoning level for this task, including none; unsupported explicit values refuse the task.",
+              "enum": [
+                "none",
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "ultra"
+              ],
+              "type": "string"
+            },
+            "skills": {
+              "description": "Skill identifiers to preload from the child profile.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "system_prompt": {
+              "description": "Additional or replacement child persona instructions; semantics are applied by the child launch policy.",
+              "type": "string"
+            },
+            "system_prompt_mode": {
+              "description": "Persona mode: replace or append; valid only when system_prompt is supplied.",
+              "enum": [
+                "replace",
+                "append"
+              ],
+              "type": "string"
+            },
+            "tools": {
+              "description": "Exact child tool-name selection; omitted inherits the existing child grant, [] grants none.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             }
           },
           "required": [

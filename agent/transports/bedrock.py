@@ -10,6 +10,30 @@ from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
 
 
+def _validate_strict_reasoning_payload(payload: dict[str, Any], reasoning_config: Any) -> None:
+    """Refuse Bedrock reasoning fields that cannot prove the exact explicit effort was sent."""
+    if not isinstance(reasoning_config, dict):
+        return
+    requested = "none" if reasoning_config.get("enabled") is False else reasoning_config.get("effort", "medium")
+    requested = str(requested or "medium").strip().lower()
+    additional = payload.get("additionalModelRequestFields")
+    if isinstance(additional, dict):
+        if requested == "none":
+            thinking = additional.get("thinking")
+            if isinstance(thinking, dict) and thinking.get("type") == "disabled":
+                return
+        output_config = additional.get("output_config")
+        if isinstance(output_config, dict) and output_config.get("effort") == requested:
+            return
+        reasoning = additional.get("reasoningConfig")
+        if (
+            isinstance(reasoning, dict) and reasoning.get("type") == "enabled"
+            and reasoning.get("maxReasoningEffort") == requested
+        ):
+            return
+    raise ValueError(f"Explicit reasoning effort {requested!r} cannot be carried exactly by this Bedrock Converse route.")
+
+
 class BedrockTransport(ProviderTransport):
     """Transport for api_mode='bedrock_converse'."""
 
@@ -46,6 +70,8 @@ class BedrockTransport(ProviderTransport):
             temperature=params.get("temperature"), guardrail_config=params.get("guardrail_config"),
             reasoning_config=params.get("reasoning_config"),
         )
+        if params.get("strict_reasoning_effort") is True:
+            _validate_strict_reasoning_payload(kwargs, params.get("reasoning_config"))
         # Sentinel keys for dispatch — agent pops these before the boto3 call
         kwargs["__bedrock_converse__"] = True
         kwargs["__bedrock_region__"] = params.get("region", "us-east-1")

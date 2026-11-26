@@ -36,6 +36,8 @@ class ToolValidationVerdict:
     action: str
     result: Optional[dict[str, Any]]
     mixed_invalid_batch: bool
+    rejected_tool_results: Optional[list[tuple[Any, str]]] = None
+    runnable_tool_calls: Optional[list[Any]] = None
 
 
 def _preview_name(name: str) -> str:
@@ -51,6 +53,22 @@ def _append_tool_error_results(messages, tool_calls, content_for) -> None:
             "tool_call_id": coalesce_tool_call_id(tc),
             "content": content_for(tc),
         })
+
+
+def _mixed_batch_results(tool_calls, accepted_names, refused_ids, agent, tool_grant_refusal,
+                         invalid_tool_name_error) -> tuple[list[tuple[Any, str]], list[Any]]:
+    """Separate denied/unknown result slots from allowed calls without editing durable messages."""
+    rejected = {}
+    for tc in tool_calls:
+        if id(tc) in refused_ids:
+            rejected[id(tc)] = json.dumps(
+                {"error": tool_grant_refusal(agent, tc.function.name)}, ensure_ascii=False)
+        elif tc.function.name not in accepted_names:
+            rejected[id(tc)] = invalid_tool_name_error(tc.function.name, accepted_names)
+    return (
+        [(tc, rejected[id(tc)]) for tc in tool_calls if id(tc) in rejected],
+        [tc for tc in tool_calls if id(tc) not in rejected],
+    )
 
 
 def _partial_exit(agent, messages, conversation_history, api_call_count, final_response: str) -> dict[str, Any]:
@@ -80,11 +98,20 @@ def validate_tool_calls(
     outright rather than retried."""
     from agent.conversation_loop import _invalid_tool_name_error_content
 
+    _mixed_invalid_batch = False
     tool_calls = assistant_message.tool_calls
-    valid_names = agent.valid_tool_names
+    from agent.delegation_launch import exact_permission_names, tool_grant_refusal
+    from toolsets import BUILTIN_TOOL_NAMES
+    permission_names = exact_permission_names(agent)
+    accepted_names = (set(agent.valid_tool_names) | set(permission_names or ())
+                      if permission_names is not None else agent.valid_tool_names)
+    valid_names = accepted_names
 
-    def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> ToolValidationVerdict:
-        return ToolValidationVerdict(action=action, result=result, mixed_invalid_batch=_mixed_invalid_batch)
+    def _verdict(action: str, result: Optional[dict[str, Any]] = None, *,
+                 rejected_tool_results=None, runnable_tool_calls=None) -> ToolValidationVerdict:
+        return ToolValidationVerdict(action=action, result=result, mixed_invalid_batch=_mixed_invalid_batch,
+                                     rejected_tool_results=rejected_tool_results,
+                                     runnable_tool_calls=runnable_tool_calls)
 
     # Uniquify duplicate tool-call ids BEFORE any downstream consumer: the
     # pre-API sanitizer keeps only the first call/result per id, and the desktop
@@ -100,8 +127,16 @@ def validate_tool_calls(
 
     # Repair mismatched tool names before validating (model hallucinations).
     repaired_ids = set()
+    refused_ids = set()
     for tc in tool_calls:
-        if tc.function.name not in valid_names:
+        if permission_names is not None and tc.function.name in BUILTIN_TOOL_NAMES and tc.function.name not in permission_names:
+            refused_ids.add(id(tc))
+            continue
+        if permission_names is not None and tc.function.name in {"tool_search", "tool_describe", "tool_call"} \
+                and tc.function.name not in permission_names:
+            refused_ids.add(id(tc))
+            continue
+        if tc.function.name not in accepted_names:
             repaired = agent._repair_tool_call(tc.function.name)
             if repaired:
                 agent._vprint(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'",
@@ -111,21 +146,17 @@ def validate_tool_calls(
     # Counted here, before any exit or normalization, so every emitted call is seen once as the model sent it.
     from hermes_cli.observability.shared_metrics_model import record_tool_call_quality
     record_tool_call_quality(agent, tool_calls, repaired_ids)
-    invalid_tool_calls = [tc.function.name for tc in tool_calls if tc.function.name not in valid_names]
-    # Mixed batch: error-result ONLY the invalid calls and run the valid
-    # ones; voiding the turn discards real work. Strikes advance only when a
-    # turn has NO valid call, so a degenerate model still halts at 3.
-    _mixed_invalid_batch = bool(invalid_tool_calls) and any(
-        tc.function.name in valid_names for tc in tool_calls
-    )
-    if _mixed_invalid_batch:
-        agent._invalid_tool_retries = 0
-        _n_valid = sum(1 for tc in tool_calls if tc.function.name in valid_names)
-        agent._buffer_vprint(
-            f"⚠️  Unknown tool '{_preview_name(invalid_tool_calls[0])}' in batch — erroring that call, "
-            f"executing {_n_valid} valid call(s)"
+    invalid_tool_calls = [tc.function.name for tc in tool_calls if tc.function.name not in accepted_names]
+    _mixed_invalid_batch = (
+        bool(invalid_tool_calls) and any(tc.function.name in accepted_names for tc in tool_calls)
+    ) or (
+        bool(refused_ids) and any(
+            id(tc) not in refused_ids and tc.function.name in accepted_names for tc in tool_calls
         )
-    elif invalid_tool_calls:
+    )
+    if invalid_tool_calls and not refused_ids and not any(
+        tc.function.name in accepted_names for tc in tool_calls
+    ):
         agent._invalid_tool_retries += 1
         # Return helpful error to model — model can agent-correct next turn
         invalid_preview = _preview_name(invalid_tool_calls[0])
@@ -144,20 +175,24 @@ def validate_tool_calls(
         # See _invalid_tool_name_error_content for the blank-name anti-priming rationale (#47967).
         _append_tool_error_results(
             messages, tool_calls,
-            lambda tc: (
-                _invalid_tool_name_error_content(tc.function.name, valid_names)
-                if tc.function.name not in valid_names
-                else "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
-            ),
+            lambda tc: _invalid_tool_name_error_content(tc.function.name, valid_names),
         )
         return _verdict("continue")
-    # Reset retry counter on successful tool call validation
-    agent._invalid_tool_retries = 0
-
+    if refused_ids and not _mixed_invalid_batch:
+        agent._invalid_tool_retries = 0
+        denied = [tc for tc in tool_calls if id(tc) in refused_ids]
+        assistant_message.tool_calls = denied
+        append_message(messages, agent._build_assistant_message(assistant_message, finish_reason))
+        _append_tool_error_results(messages, denied, lambda tc: json.dumps(
+            {"error": tool_grant_refusal(agent, tc.function.name)}, ensure_ascii=False))
+        assistant_message.tool_calls = [tc for tc in tool_calls if id(tc) not in refused_ids]
+        return _verdict("continue")
     # Validate tool call arguments are valid JSON; empty strings become empty
     # objects (common model quirk).
+    validation_calls = ([tc for tc in tool_calls if id(tc) not in refused_ids and tc.function.name in valid_names]
+                        if _mixed_invalid_batch else tool_calls)
     invalid_json_args = []
-    for tc in tool_calls:
+    for tc in validation_calls:
         args = tc.function.arguments
         if isinstance(args, (dict, list)):
             tc.function.arguments = json.dumps(args)
@@ -182,7 +217,7 @@ def validate_tool_calls(
         # mid-stream.
         _truncated = any(
             not (tc.function.arguments or "").rstrip().endswith(("}", "]"))
-            for tc in tool_calls if tc.function.name in invalid_names
+            for tc in validation_calls if tc.function.name in invalid_names
         )
         if _truncated:
             agent._vprint(
@@ -228,8 +263,15 @@ def validate_tool_calls(
                 f"Please retry with valid JSON."
             )
 
-        _append_tool_error_results(messages, tool_calls, _json_error_result)
+        _append_tool_error_results(messages, validation_calls, _json_error_result)
         return _verdict("continue")
+
+    if _mixed_invalid_batch:
+        rejected, valid = _mixed_batch_results(
+            tool_calls, accepted_names, refused_ids, agent, tool_grant_refusal,
+            _invalid_tool_name_error_content)
+        agent._invalid_tool_retries = 0
+        return _verdict("ok", rejected_tool_results=rejected, runnable_tool_calls=valid)
 
     # Reset retry counter on successful JSON validation
     agent._invalid_json_retries = 0

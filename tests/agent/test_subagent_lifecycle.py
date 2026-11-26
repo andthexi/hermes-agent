@@ -348,11 +348,13 @@ def test_plugin_toolsets_are_known_toolsets(lifecycle, monkeypatch):
 
 
 def test_provider_is_plugin_facing_only():
-    """``provider`` lives on the plugin request; no model-facing delegate_task field can carry a route."""
+    """Route identity is per task; raw credentials/endpoints are never model-facing."""
     import dataclasses
     from tools.delegate_tool import DELEGATE_TASK_SCHEMA
 
     assert "provider" in {field.name for field in dataclasses.fields(SubagentLaunchRequest)}
     props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
-    exposed = set(props) | set(props["tasks"]["items"]["properties"])
-    assert not exposed & {"provider", "model", "base_url", "api_key"}
+    task_props = set(props["tasks"]["items"]["properties"])
+    assert {"model", "provider"} <= task_props
+    assert not {"model", "provider"} & set(props)
+    assert not {"api_key", "base_url"} & (set(props) | task_props)

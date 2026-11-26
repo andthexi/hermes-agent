@@ -12,8 +12,9 @@ from typing import Any
 from urllib.parse import urlparse
 
 from agent.reasoning_effort import (
-    GEMINI4_THINKING_LEVELS, KIMI_K3_EFFORTS, KIMI_K3_OVERRIDES, OPENAI_COMPAT_WIRE_EFFORTS, clamp_effort,
-    clamp_reasoning_config, kimi_supported_efforts, requested_effort, tokenhub_effort,
+    GEMINI4_THINKING_LEVELS, KIMI_K3_EFFORTS, KIMI_K3_OVERRIDES, OPENAI_COMPAT_WIRE_EFFORTS,
+    TOKENHUB_EFFORTS, clamp_effort, clamp_reasoning_config, kimi_supported_efforts,
+    requested_effort, tokenhub_effort,
 )
 from agent.message_metadata import DATA_USE, MESSAGE_UID, data_use_requirement
 from agent.message_sanitization import coalesce_tool_call_id, normalize_finish_reason as _normalize_finish_reason
@@ -155,16 +156,178 @@ def is_router_timeout_shim(response: Any) -> bool:
     return not _has_positive_completion_tokens(getattr(response, "usage", None))
 
 
-def _reasoning_config_for_model(model: str, reasoning_config: dict | None) -> dict | None:
+def _reasoning_config_for_model(
+    model: str, reasoning_config: dict | None, *, strict: bool = False, provider_profile: Any = None,
+) -> dict | None:
     """Clamp Hermes' extended effort set (``ultra``) to the OpenAI-compat wire vocabulary.
 
     Hermes' internal effort set extends the wire vocabulary with ``ultra`` (the /reasoning command documents
-    none..xhigh|max|ultra). OpenAI- compatible wires — OpenRouter chief among them — accept exactly
-    max|xhigh|high|medium|low|minimal|none and reject the extension with HTTP 400 (#89503). Clamp against
-    the declared wire vocabulary via the shared policy in ``agent.reasoning_effort``; provider profiles with
-    narrower sets clamp again downstream.
+    none..xhigh|max|ultra). Explicit child values are strict: if this route's known vocabulary cannot carry the
+    requested effort, fail rather than clamp or omit it. Unrestricted callers retain the legacy clamp.
     """
+    if strict and isinstance(reasoning_config, dict):
+        effort = requested_effort(reasoning_config)
+        if effort is None and reasoning_config.get("enabled") is not False:
+            return reasoning_config
+        if effort is None and reasoning_config.get("enabled") is False:
+            effort = "none"
+        if effort is None:
+            return reasoning_config
+        if effort not in OPENAI_COMPAT_WIRE_EFFORTS:
+            if provider_profile is None:
+                return reasoning_config
+            declared = provider_profile.supported_reasoning_efforts(model)
+            if declared is not None and effort not in declared:
+                profile_name = provider_profile.name if provider_profile is not None else "provider profile"
+                raise ValueError(f"Explicit reasoning effort {effort!r} is unsupported by {profile_name} for {model!r}.")
+        else:
+            declared = provider_profile.supported_reasoning_efforts(model) if provider_profile is not None else None
+            if effort == "none" and declared is not None and "none" not in declared:
+                profile_name = provider_profile.name if provider_profile is not None else "provider profile"
+                raise ValueError(f"Explicit reasoning effort 'none' is unsupported by {profile_name} for {model!r}.")
+            if declared is not None and effort not in declared and effort != "none":
+                profile_name = provider_profile.name if provider_profile is not None else "provider profile"
+                raise ValueError(f"Explicit reasoning effort {effort!r} is unsupported by {profile_name} for {model!r}.")
+        return reasoning_config
     return clamp_reasoning_config(reasoning_config, OPENAI_COMPAT_WIRE_EFFORTS)
+
+
+def _strict_reasoning_intent(reasoning_config: Any) -> tuple[bool, bool, Any] | None:
+    """Return explicit enable/disable and effort, rejecting a contradictory request."""
+    if not isinstance(reasoning_config, dict) or not ("enabled" in reasoning_config or "effort" in reasoning_config):
+        return None
+    enabled = reasoning_config.get("enabled") is True
+    disabled = reasoning_config.get("enabled") is False
+    effort = reasoning_config.get("effort")
+    if enabled and effort == "none":
+        raise ValueError("Explicit enabled reasoning conflicts with reasoning effort 'none'.")
+    return enabled, disabled or (not enabled and effort == "none"), effort
+
+
+def _strict_reasoning_carriers(api_kwargs: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten nested extra_body dictionaries, which may add conflicting wire carriers."""
+    carriers = [api_kwargs]
+    index = 0
+    while index < len(carriers):
+        nested = carriers[index].get("extra_body")
+        index += 1
+        if isinstance(nested, dict):
+            carriers.append(nested)
+    return carriers
+
+
+def _strict_record_effort(efforts: list[Any], states: list[bool], value: Any) -> None:
+    efforts.append(value)
+    states.append(value != "none")
+
+
+def _strict_thinking_config_state(config: Any) -> tuple[list[Any], list[bool]]:
+    """Extract exact Gemini effort and disable indicators; visibility flags are not disable signals."""
+    efforts: list[Any] = []
+    states: list[bool] = []
+    if not isinstance(config, dict):
+        return efforts, states
+    level = config.get("thinking_level") or config.get("thinkingLevel")
+    if level is not None:
+        _strict_record_effort(efforts, states, level)
+    budget = config.get("thinking_budget", config.get("thinkingBudget"))
+    if isinstance(budget, (int, float)) and not isinstance(budget, bool):
+        states.append(budget != 0)
+    # Gemini includeThoughts/include_thoughts only controls response visibility.
+    return efforts, states
+
+
+def _strict_carrier_reasoning_state(carrier: dict[str, Any]) -> tuple[list[Any], list[bool]]:
+    efforts: list[Any] = []
+    states: list[bool] = []
+    if "reasoning_effort" in carrier:
+        _strict_record_effort(efforts, states, carrier["reasoning_effort"])
+    reasoning = carrier.get("reasoning")
+    if isinstance(reasoning, dict):
+        if "effort" in reasoning:
+            _strict_record_effort(efforts, states, reasoning["effort"])
+        if isinstance(reasoning.get("enabled"), bool):
+            states.append(reasoning["enabled"])
+    thinking = carrier.get("thinking")
+    if isinstance(thinking, dict):
+        if thinking.get("type") == "disabled":
+            states.append(False)
+        elif thinking.get("type") == "enabled":
+            states.append(True)
+    for key in ("thinking_config", "thinkingConfig"):
+        config_efforts, config_states = _strict_thinking_config_state(carrier.get(key))
+        efforts.extend(config_efforts)
+        states.extend(config_states)
+    google = carrier.get("google")
+    if isinstance(google, dict):
+        config_efforts, config_states = _strict_thinking_config_state(
+            google.get("thinking_config", google.get("thinkingConfig")),
+        )
+        efforts.extend(config_efforts)
+        states.extend(config_states)
+    return efforts, states
+
+
+def _strict_payload_reasoning_state(api_kwargs: dict[str, Any]) -> tuple[list[Any], list[bool]]:
+    efforts: list[Any] = []
+    states: list[bool] = []
+    for carrier in _strict_reasoning_carriers(api_kwargs):
+        carrier_efforts, carrier_states = _strict_carrier_reasoning_state(carrier)
+        efforts.extend(carrier_efforts)
+        states.extend(carrier_states)
+    return efforts, states
+
+
+def _validate_strict_disable(efforts: list[Any], states: list[bool]) -> None:
+    exact_disable = (
+        any(state is False for state in states)
+        and all(state is False for state in states)
+        and all(effort == "none" for effort in efforts)
+    )
+    if not exact_disable:
+        raise ValueError("Explicit reasoning effort 'none' cannot be carried exactly by the final request.")
+
+
+def _validate_strict_enable(
+    requested_effort: Any, explicitly_enabled: bool, efforts: list[Any], states: list[bool],
+    params: dict[str, Any], model: str, is_gemini: bool,
+) -> None:
+    if requested_effort is None and explicitly_enabled:
+        if any(state is False for state in states):
+            raise ValueError("Explicit enabled reasoning conflicts with a disabled final request carrier.")
+        return
+    if (params.get("is_kimi") or params.get("is_tokenhub")) and requested_effort is not None:
+        supported = kimi_supported_efforts(model) if params.get("is_kimi") else TOKENHUB_EFFORTS
+        if requested_effort not in supported:
+            raise ValueError(f"Explicit reasoning effort {requested_effort!r} cannot be carried exactly by the final request.")
+    if explicitly_enabled and is_gemini and not efforts:
+        raise ValueError("Explicit enabled Gemini reasoning must carry an exact effort in the final request.")
+    if requested_effort is not None and not efforts:
+        raise ValueError(f"Provider profile did not preserve explicit reasoning effort {requested_effort!r} in the final request.")
+    exact_enabled = any(state is True for state in states) and all(state is True for state in states)
+    exact_effort = requested_effort is None or all(effort == requested_effort for effort in efforts)
+    if not exact_enabled or not exact_effort:
+        if requested_effort is not None:
+            raise ValueError(f"Provider profile did not preserve explicit reasoning effort {requested_effort!r} in the final request.")
+        raise ValueError("Explicit enabled reasoning cannot be carried exactly by the final request.")
+
+
+def _validate_strict_reasoning_payload(api_kwargs: dict[str, Any], reasoning_config: Any, params: dict[str, Any], model: str) -> None:
+    """Verify strict explicit reasoning against the final Chat Completions request payload."""
+    intent = _strict_reasoning_intent(reasoning_config)
+    if intent is None:
+        return
+    explicitly_enabled, wants_disabled, requested_effort = intent
+    efforts, states = _strict_payload_reasoning_state(api_kwargs)
+    if wants_disabled:
+        _validate_strict_disable(efforts, states)
+        return
+    profile = params.get("provider_profile")
+    is_gemini = (
+        str(params.get("provider_name") or "").strip().lower() == "gemini"
+        or getattr(profile, "name", None) == "gemini"
+    )
+    _validate_strict_enable(requested_effort, explicitly_enabled, efforts, states, params, model, is_gemini)
 
 
 def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> dict | None:
@@ -582,10 +745,11 @@ class ChatCompletionsTransport(ProviderTransport):
 
         sanitized = _swap_developer_role(sanitized, params.get("model_lower", (model or "").lower()))
         api_kwargs = _base_kwargs(model, sanitized, tools, params)
-
         is_kimi = params.get("is_kimi", False)
         supports_reasoning = params.get("supports_reasoning", False)
-        reasoning_config = _reasoning_config_for_model(model, params.get("reasoning_config"))
+        reasoning_config = _reasoning_config_for_model(
+            model, params.get("reasoning_config"), strict=bool(params.get("strict_reasoning_effort")),
+        )
         _apply_max_tokens(api_kwargs, model, reasoning_config, params)
 
         # Kimi / TokenHub by host (agents with no registered profile): top-level reasoning_effort (unless thinking disabled).
@@ -643,6 +807,8 @@ class ChatCompletionsTransport(ProviderTransport):
             api_kwargs["extra_body"] = extra_body
         if params.get("request_overrides"):
             api_kwargs.update(params["request_overrides"])
+        if params.get("strict_reasoning_effort"):
+            _validate_strict_reasoning_payload(api_kwargs, params.get("reasoning_config"), params, model)
         return _finish_kwargs(
             api_kwargs, sanitized, params,
             supports_prompt_cache_key=bool(params.get("supports_prompt_cache_key")) or _is_openai_api_base_url(base_url),
@@ -653,13 +819,21 @@ class ChatCompletionsTransport(ProviderTransport):
         sanitized = _swap_developer_role(profile.prepare_messages(sanitized), (model or "").lower())
         api_kwargs = _base_kwargs(model, sanitized, tools, params, profile=profile)
 
-        reasoning_config = _reasoning_config_for_model(model, params.get("reasoning_config"))
+        reasoning_config = _reasoning_config_for_model(
+            model, params.get("reasoning_config"), strict=bool(params.get("strict_reasoning_effort")),
+            provider_profile=profile,
+        )
         # Profiles fronting several backends override get_max_tokens() per model.
         _apply_max_tokens(api_kwargs, model, reasoning_config, params, profile_max=profile.get_max_tokens(model))
 
         # LM Studio's probed allowed_options ride only when present, so plugin hooks written
         # against the older keyword set (no ``**context``) keep working.
         _lm_options = params.get("lmstudio_reasoning_options")
+        if params.get("strict_reasoning_effort") and _lm_options and isinstance(reasoning_config, dict):
+            supported = {"none" if option == "off" else "medium" if option == "on" else option for option in _lm_options}
+            requested = "none" if reasoning_config.get("enabled") is False else reasoning_config.get("effort")
+            if requested is not None and requested not in supported:
+                raise ValueError(f"Explicit reasoning effort {requested!r} is unsupported by this LM Studio model.")
         extra_body_from_profile, top_level_from_profile = profile.build_api_kwargs_extras(
             reasoning_config=reasoning_config, supports_reasoning=params.get("supports_reasoning", False),
             qwen_session_metadata=params.get("qwen_session_metadata"), model=model,
@@ -683,6 +857,9 @@ class ChatCompletionsTransport(ProviderTransport):
                 extra_body.update(v)
             else:
                 api_kwargs[k] = v
+        if params.get("strict_reasoning_effort"):
+            payload_for_check = {**api_kwargs, "extra_body": extra_body}
+            _validate_strict_reasoning_payload(payload_for_check, params.get("reasoning_config"), params, model)
 
         if extra_body:
             # Native Gemini speaks Google's REST schema: OpenAI-style extra_body
@@ -697,6 +874,8 @@ class ChatCompletionsTransport(ProviderTransport):
                 extra_body = {k: v for k, v in extra_body.items() if k in ("thinking_config", "thinkingConfig", "max_output_tokens")}
             if extra_body:
                 api_kwargs["extra_body"] = extra_body
+        if params.get("strict_reasoning_effort"):
+            _validate_strict_reasoning_payload(api_kwargs, params.get("reasoning_config"), params, model)
         return _finish_kwargs(
             api_kwargs, sanitized, params, supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False)),
         )

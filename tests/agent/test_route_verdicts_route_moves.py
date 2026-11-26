@@ -178,7 +178,7 @@ _B_URL = "https://second.example/v1"
 
 def _spent_effort_repair(agent):
     """A rejects ``effort: max`` and its one-shot repair runs: the retry goes out without it."""
-    from agent.chat_completion_helpers import _reasoning_config_for_wire
+    from agent.reasoning_params import _reasoning_config_for_wire
     from agent.turn_retry_state import TurnRetryState
     from tests.agent.test_reasoning_disable_recovery import _STRUCTURED_LEVEL_400
 
@@ -192,7 +192,7 @@ def _spent_effort_repair(agent):
 def _destination_effort_repaired(agent, retry, moved):
     """On another endpoint the configured effort goes out again and its rejection gets its own repair;
     on the same endpoint the verdict holds and the spent repair stays spent."""
-    from agent.chat_completion_helpers import _reasoning_config_for_wire
+    from agent.reasoning_params import _reasoning_config_for_wire
     from tests.agent.test_reasoning_disable_recovery import _STRUCTURED_LEVEL_400
 
     assert _reasoning_config_for_wire(agent) == ({"enabled": True, "effort": "max"} if moved else None)

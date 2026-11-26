@@ -2467,6 +2467,10 @@ def _pre_tool_block_message(agent, function_name, function_args, effective_task_
         return None, function_args
 
 
+from tools.thread_context import exact_tool_scope_for_agent as _exact_tool_scope_for_agent
+
+
+@_exact_tool_scope_for_agent
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
                  tool_call_id: Optional[str] = None, messages: list | None = None,
                  pre_tool_block_checked: bool = False,
@@ -2480,6 +2484,16 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         InlineToolContext, apply_transform_tool_result, emit_terminal_post_tool_call,
         resolve_invoke_tool_executor, tool_hook_ids
     )
+    from tools.thread_context import exact_tool_refusal
+    if refusal := exact_tool_refusal(function_name):
+        result = json.dumps({"error": refusal}, ensure_ascii=False)
+        emit_terminal_post_tool_call(
+            agent, function_name=function_name, function_args=function_args, result=result,
+            effective_task_id=effective_task_id, tool_call_id=tool_call_id, status="blocked",
+            error_type="tool_grant_refused", error_message=refusal,
+            middleware_trace=tool_request_middleware_trace or [],
+        )
+        return result
     if not isinstance(function_args, dict):
         function_args = {}
     hook_ids = tool_hook_ids(agent, effective_task_id, tool_call_id)
@@ -2553,53 +2567,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
 
 def repair_tool_call(agent, tool_name: str) -> str | None:
-    """Repair a mismatched tool name (case, separators, CamelCase, ``_tool`` suffixes twice so
-    ``TodoTool_tool`` reduces fully, then fuzzy match) before aborting. Returns the repaired
-    name if in valid_tool_names, else None."""
-    from difflib import get_close_matches
-    if not tool_name:
-        return None
-    # VolcEngine api/plan leaks XML attribute fragments into tool_use.name (`terminal"
-    # parameter="command" ...`); trim at the first quote/angle bracket. Do NOT split on whitespace:
-    # "write file" must reach ``_norm`` -> ``write_file``.
-    # `terminal" parameter="command" string="true` `execute_code" parameter="code" string="true`
-    # `session_search" parameter="session_id" string="true` We trim at the first unambiguous XML/quote
-    # character so the rest of the repair pipeline (lowercase / snake_case / fuzzy match) can resolve the
-    # cleaned name to a real tool. Crucially we DO NOT split on whitespace: legitimate inputs like "write
-    # file" must keep flowing through ``_norm`` -> ``write_file`` (covered by test_space_to_underscore in
-    # tests/agent/test_repair_tool_call_name.py). See #33007.
-    for _xml_sep in ('"', "'", "<", ">"):
-        _idx = tool_name.find(_xml_sep)
-        if _idx > 0:
-            tool_name = tool_name[:_idx]
-    if not tool_name:
-        return None
-    _norm = lambda s: s.lower().replace("-", "_").replace(" ", "_")
-    _camel_snake = lambda s: re.sub(r"(?<!^)(?=[A-Z])", "_", s).lower()
-
-    def _strip_tool_suffix(s: str) -> str | None:
-        lc = s.lower()
-        return next((s[: -len(sfx)].rstrip("_-") for sfx in ("_tool", "-tool", "tool") if lc.endswith(sfx)), None)
-    # Cheap fast-paths first.
-    lowered = tool_name.lower()
-    if lowered in agent.valid_tool_names:
-        return lowered
-    normalized = _norm(tool_name)
-    if normalized in agent.valid_tool_names:
-        return normalized
-    cands: set[str] = {tool_name, lowered, normalized, _camel_snake(tool_name)}
-    for _ in range(2):  # strip trailing tool-suffix up to twice (TodoTool_tool needs it)
-        extra: set[str] = set()
-        for c in cands:
-            stripped = _strip_tool_suffix(c)
-            if stripped:
-                extra.update((stripped, _norm(stripped), _camel_snake(stripped)))
-        cands |= extra
-    for c in cands:
-        if c and c in agent.valid_tool_names:
-            return c
-    matches = get_close_matches(lowered, agent.valid_tool_names, n=1, cutoff=0.7)
-    return matches[0] if matches else None
+    """Repair a model's tool-name mismatch within launch policy."""
+    from agent.delegation_launch import repair_tool_name
+    return repair_tool_name(agent, tool_name)
 
 
 # Escalate repeated heals once per session window, then stay quiet: repeated heals of the same poisoned

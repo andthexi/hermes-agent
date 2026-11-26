@@ -28,7 +28,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from tools.code_kernel import RUNNER_CELL_SOURCE, KernelRegistry
+from tools.code_kernel import CellAuthority, RUNNER_CELL_SOURCE, KernelRegistry
+from tools.code_execution_rpc import _rpc_token_ok
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,9 @@ class RemoteKernel:
     pid: str
     rpc_token: str
     owner: str
+    cell_authority: Optional[CellAuthority] = None
+    cell_lock: Any = field(default_factory=threading.RLock)
+    sandbox_tools: frozenset[str] = frozenset()
     last_used: float = field(default_factory=time.monotonic)
     execution_count: int = 0
     cell_seq: int = 0
@@ -138,6 +142,10 @@ class RemoteKernel:
 
     def kill(self) -> None:
         """Best-effort kill of the runner and its subprocesses, then rm -rf."""
+        with self.cell_lock:
+            if self.cell_authority is not None:
+                self.cell_authority.retire()
+                self.cell_authority = None
         q_pid = shlex.quote(self.pid)
         for cmd, failure in (
             # Kill the runner's children if the shell gave it a group, then the PID itself.
@@ -246,7 +254,8 @@ def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
             logger.warning("remote kernel spawn returned no PID: %r", started)
         else:
             candidate = RemoteKernel(env=env, env_type=env_type, kernel_dir=kernel_dir,
-                                     pid=pid, rpc_token=rpc_token, owner=owner)
+                                     pid=pid, rpc_token=rpc_token, owner=owner,
+                                     sandbox_tools=frozenset(sandbox_tools))
             if candidate.is_alive():
                 kernel = candidate
             else:
@@ -305,15 +314,20 @@ def _run_remote_cell(kernel: RemoteKernel, code: str, timeout: int) -> tuple[str
     kernel.cell_seq += 1
     seq = f"{kernel.cell_seq:06d}"
     q_cells, q_res = shlex.quote(f"{kernel.kernel_dir}/cells"), shlex.quote(f"cell_res_{seq}.json")
+    with kernel.cell_lock:
+        authority = kernel.cell_authority
+        if authority is None or not authority.active:
+            return "retired", {}
     # One round-trip: tmp write + rename publishes the request atomically.
     _ship_file_to_remote(kernel.env, f"{kernel.kernel_dir}/cells/cell_req_{seq}.json",
-                         json.dumps({"id": seq, "code": code}, ensure_ascii=False), atomic=True)
+                         json.dumps({"id": seq, "code": code, "cell_token": authority.token},
+                                    ensure_ascii=False), atomic=True)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             body = kernel.sh(f"cat {q_cells}/{q_res} 2>/dev/null", timeout=20).strip()
         except Exception:
-            # One flaky round-trip is not kernel death; liveness decides.
+            # A flaky transport read doesn't prove kernel death; liveness decides.
             body = ""
         if body:
             try:
@@ -324,9 +338,8 @@ def _run_remote_cell(kernel: RemoteKernel, code: str, timeout: int) -> tuple[str
             try:
                 kernel.sh(f"rm -f {q_cells}/{q_res}", timeout=10)
             except Exception:
-                # Best-effort: the cell already ran, so raising here would send
-                # the caller to its per-call fallback and run the code twice.
-                # A leftover result file is harmless (seq is monotonic).
+                # The cell ran; avoid per-call fallback (and duplicate execution). Monotonic seq
+                # makes a leftover result harmless.
                 logger.debug("remote kernel: cell result cleanup failed", exc_info=True)
             return status, payload
         time.sleep(_CELL_POLL_INTERVAL)
@@ -340,7 +353,9 @@ def execute_in_remote_kernel(
     """Run one cell in the owner's remote kernel. Returns the raw cell result dict (caller
     post-processes output), or ``None`` when no kernel could be spawned (caller falls open to
     per-call). ``state_lost``/``state_reset``/``reused`` ride in the ``kernel`` sub-dict."""
+    from tools.code_execution_tool import _intersect_sandbox_helpers
     from tools.code_kernel import _resolve_owner
+    sandbox_tools = _intersect_sandbox_helpers(sandbox_tools)
     owner = _resolve_owner(task_env_id)
     kernel, reused, state_reset, state_lost = _acquire_remote_kernel(
         env, env_type, owner, task_env_id, sandbox_tools, reset=reset, idle_exit=idle_exit)
@@ -366,27 +381,47 @@ def execute_in_remote_kernel(
 def _run_attached_cell(kernel: RemoteKernel, key: tuple, code: str, *, env, task_env_id: str,
                        sandbox_tools: frozenset, timeout: int, max_tool_calls: int,
                        reused: bool, state_reset: bool, state_lost: bool) -> dict[str, Any]:
+    # Authority is per cell, so same-key remote requests must not replace it until
+    # the preceding cell's runner, RPC poller and cleanup have fully settled.
+    with kernel.cell_lock:
+        return _run_attached_cell_window(
+            kernel, key, code, env=env, task_env_id=task_env_id, sandbox_tools=sandbox_tools,
+            timeout=timeout, max_tool_calls=max_tool_calls, reused=reused,
+            state_reset=state_reset, state_lost=state_lost,
+        )
+
+
+def _run_attached_cell_window(kernel: RemoteKernel, key: tuple, code: str, *, env, task_env_id: str,
+                              sandbox_tools: frozenset, timeout: int, max_tool_calls: int,
+                              reused: bool, state_reset: bool, state_lost: bool) -> dict[str, Any]:
+    from agent.memory_provider import spawn_context_thread
     from tools.code_execution_rpc import tool_errors_since
-    from tools.code_execution_tool import _rpc_poll_loop
-    from tools.thread_context import propagate_context_to_thread
+    from tools.thread_context import exact_tool_scope, propagate_context_to_thread
+    from tools.code_execution_rpc import _rpc_poll_loop
     # Clean stale tool-RPC requests from a previous cell before arming this cell's poll loop, so
     # a background thread the last cell leaked cannot smuggle a call into this authority window.
     q_rpc = shlex.quote(kernel.kernel_dir + '/rpc')
     try:
         kernel.sh(f"rm -f {q_rpc}/req_* {q_rpc}/res_*", timeout=10)
-    except Exception:
-        pass
+    except (OSError, RuntimeError) as exc:
+        logger.debug("Could not clean stale remote RPC requests: %s", exc, exc_info=True)
     tool_call_counter, tool_call_log, stop_event = [0], [], threading.Event()
-    # Per-cell RPC thread carrying THIS call's approval/session context — the remote analogue
-    # of CellAuthority: authority lives exactly as long as the cell's poll loop.
-    rpc_thread = threading.Thread(
-        target=propagate_context_to_thread(_rpc_poll_loop), daemon=True,
-        args=(env, f"{kernel.kernel_dir}/rpc", task_env_id, tool_call_log, tool_call_counter,
-              max_tool_calls, sandbox_tools, stop_event, kernel.rpc_token))
+    with exact_tool_scope(sandbox_tools):
+        authority = CellAuthority(task_env_id, sandbox_tools)
+    with kernel.cell_lock:
+        kernel.cell_authority = authority
+    def _poll_cell_rpc() -> None:
+        _rpc_poll_loop(
+            env, f"{kernel.kernel_dir}/rpc", task_env_id, tool_call_log, tool_call_counter,
+            max_tool_calls, sandbox_tools, stop_event, kernel.rpc_token, cell_authority=authority,
+        )
+    rpc_thread = spawn_context_thread(
+        propagate_context_to_thread(_poll_cell_rpc), name="hermes-remote-kernel-rpc")
     rpc_thread.start()
     cell_status, cell_payload = "no-result", {}
     try:
-        cell_status, cell_payload = _run_remote_cell(kernel, code, timeout)
+        with exact_tool_scope(sandbox_tools):
+            cell_status, cell_payload = _run_remote_cell(kernel, code, timeout)
     except Exception:
         # The atomic ship is the only remote call here that can raise (the poll
         # and result cleanup are best-effort), so the request never reached the runner and the
@@ -396,6 +431,10 @@ def _run_attached_cell(kernel: RemoteKernel, key: tuple, code: str, *, env, task
         _REGISTRY.discard(key, kernel)
         raise
     finally:
+        authority.retire()
+        with kernel.cell_lock:
+            if kernel.cell_authority is authority:
+                kernel.cell_authority = None
         stop_event.set()
         rpc_thread.join(timeout=5)
     kernel_info: dict[str, Any] = {"reused": reused, "remote": True}
@@ -404,11 +443,13 @@ def _run_attached_cell(kernel: RemoteKernel, key: tuple, code: str, *, env, task
         "traceback": cell_payload.get("traceback", ""), "tool_calls_made": tool_call_counter[0], "kernel": kernel_info,
         "tool_errors": tool_errors_since(tool_call_log),
     }
-    if cell_status in ("timeout", "protocol-error", "no-result"):
+    if cell_status in ("timeout", "protocol-error", "no-result", "retired"):
         # No safe way to interrupt one cell in place (same contract as local): kill, report, respawn.
         _REGISTRY.discard(key, kernel)
         if cell_status == "timeout":
             result["status"] = "timeout"
+        elif cell_status == "retired":
+            result["error"] = "Remote cell authority retired before execution."
         kernel_info.update(ended=True, state_lost=True, note=(
             "Cell timed out; the remote session kernel was killed and its state was lost. The next call "
             "starts a fresh kernel." if cell_status == "timeout"

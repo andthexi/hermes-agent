@@ -57,6 +57,7 @@ from tools.delegate_tool_toolsets import (
 from tools.delegate_tool_results import (
     _apply_summary_budget, _build_child_preserving_parent_tools, _run_child_lifecycle, _summarize_tool_arguments,
 )
+from tools.delegate_tool_options import TaskRouteOptions
 
 _ROLES = frozenset({"leaf", "orchestrator"})
 
@@ -223,13 +224,11 @@ def _build_child_agent(
     # callers such as /review pass auxiliary.review here so fallback policy is
     # not accidentally read from the general delegation block.
     routing_cfg: Optional[dict[str, Any]] = None,
-    # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
-    # Per-task route from the delegation provider (tools/delegate_tool_routes.py): a reasoning
-    # effort that beats delegation.reasoning_effort, and the profile home the child runs as.
     override_reasoning_effort: Any = None,
     profile_home: Optional[Path] = None,
-    override_service_tier: Optional[str] = None,  # a route's checked speed tier (tools/delegate_tool_tuning.py)
+    override_service_tier: Optional[str] = None,
+    launch_policy: Any = None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair. ``profile_home`` builds (and later runs,
@@ -254,6 +253,32 @@ def _build_child_agent(
     # as auxiliary.review.
     delegation_cfg = _load_config()
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
+    selected_policy = launch_policy
+    if selected_policy is not None:
+        from dataclasses import replace as dataclass_replace
+        from agent.delegation_launch import DelegationLaunchPolicy
+        if not isinstance(selected_policy, DelegationLaunchPolicy):
+            raise TypeError("launch_policy must be a DelegationLaunchPolicy.")
+        from tools.delegate_tool_validation import _parent_tool_grant
+        grant = _parent_tool_grant(parent_agent)
+        if grant is None:
+            grant = selected_policy.parent_tool_grant
+        selected_policy = dataclass_replace(
+            selected_policy,
+            profile_home=(str(profile_home) if profile_home is not None else selected_policy.profile_home),
+            workspace=selected_policy.workspace or _resolve_workspace_hint(parent_agent),
+            parent_tool_grant=grant,
+        )
+        if selected_policy.identity_snapshot is None and selected_policy.system_prompt_mode != "replace":
+            from agent.prompt_builder import DEFAULT_AGENT_IDENTITY, load_soul_md
+            identity_home = Path(profile_home) if profile_home is not None else _parent_live_home(parent_agent)
+            identity_soul = load_soul_md(home_override=identity_home)
+            selected_policy = dataclass_replace(
+                selected_policy,
+                identity_snapshot=identity_soul or DEFAULT_AGENT_IDENTITY,
+                identity_soul_loaded=bool(identity_soul),
+            )
+
     child_prompt = _build_child_system_prompt(
         goal, context, workspace_path=_resolve_workspace_hint(parent_agent), role=effective_role,
         max_spawn_depth=max_spawn, child_depth=child_depth,
@@ -296,24 +321,28 @@ def _build_child_agent(
         child_checkpoint_required = checkpoint_required_from_config()
         with delegated_child_context():
             try:
-                child = AIAgent(
-                    **rt, max_iterations=max_iterations, prefill_messages=getattr(parent_agent, "prefill_messages", None),
-                    enabled_toolsets=child_toolsets, disabled_toolsets=child_disabled_toolsets, quiet_mode=True,
-                    ephemeral_system_prompt=child_prompt, log_prefix=f"[subagent-{task_index}]", platform="subagent",
-                    side_agent=True,
-                    skip_context_files=True, skip_memory=not child_checkpoint_required,
-                    memory_agent_context="subagent", clarify_callback=None,
-                    thinking_callback=(
-                        (lambda text: _safe_progress(child_progress_cb, "_thinking", text) if text else None)
-                        if child_progress_cb else None
-                    ),
-                    session_db=child_session_db, parent_session_id=parent_sid, request_overrides=request_overrides,
-                    session_id=getattr(child_session_db, "reserved_session_id", None),
-                    tool_progress_callback=child_progress_cb,
-                    iteration_budget=None,  # fresh budget per subagent
-                    # A profile route carries that profile's identity (its SOUL.md under the bound home).
-                    **({"load_soul_identity": True} if profile_home is not None else {}),
-                )
+                with delegated_profile_scope(profile_home):
+                    child = AIAgent(
+                        **rt, max_iterations=max_iterations,
+                        prefill_messages=getattr(parent_agent, "prefill_messages", None),
+                        enabled_toolsets=child_toolsets, disabled_toolsets=child_disabled_toolsets, quiet_mode=True,
+                        ephemeral_system_prompt=child_prompt, log_prefix=f"[subagent-{task_index}]", platform="subagent",
+                        side_agent=True,
+                        skip_context_files=True, skip_memory=not child_checkpoint_required,
+                        memory_agent_context="subagent", clarify_callback=None,
+                        thinking_callback=(
+                            (lambda text: _safe_progress(child_progress_cb, "_thinking", text) if text else None)
+                            if child_progress_cb else None
+                        ),
+                        session_db=child_session_db, parent_session_id=parent_sid, request_overrides=request_overrides,
+                        session_id=getattr(child_session_db, "reserved_session_id", None),
+                        tool_progress_callback=child_progress_cb,
+                        strict_reasoning_effort=bool(getattr(selected_policy, "strict_reasoning", False)),
+                        delegation_launch_policy=selected_policy,
+                        iteration_budget=None,  # fresh budget per subagent
+                        # A profile route carries that profile's identity (its SOUL.md under the bound home).
+                        **({"load_soul_identity": True} if profile_home is not None else {}),
+                    )
             except BaseException:
                 # No child close() will ever run: release the dedicated handle here.
                 if child_session_db is not None:
@@ -356,7 +385,13 @@ def _build_child_agent(
         from tools.delegate_tool_sessions import SUBAGENT_ID_KEY
         child._session_init_model_config["_delegate_from"] = parent_sid
         child._session_init_model_config[SUBAGENT_ID_KEY] = subagent_id
-    child._delegate_profile_home = profile_home  # _ChildRun.await_child runs the conversation in this scope
+    child.__dict__["_delegate_profile_home"] = profile_home  # _ChildRun.await_child runs the conversation in this scope
+    if selected_policy is not None:
+        child.__dict__["_delegation_launch_policy"] = selected_policy
+        child.__dict__["_strict_reasoning_effort"] = selected_policy.strict_reasoning
+        child.__dict__["_delegate_route_diagnostics"] = dict(selected_policy.diagnostics)
+        child.__dict__["_strict_requested_reasoning_effort"] = selected_policy.reasoning_effort
+        child.__dict__["_delegate_profile_home"] = selected_policy.profile_home
     if child_pool is not None:
         child._credential_pool = child_pool
 
@@ -458,6 +493,7 @@ def _route_overrides(route: Any) -> dict[str, Any]:
     return {
         **_credential_overrides(route.creds, route.routing_cfg),
         "override_reasoning_effort": route.reasoning_effort, "profile_home": route.profile_home,
+        "launch_policy": route.launch_policy,
     }
 
 
@@ -474,7 +510,7 @@ def _build_children(
     for i, t in enumerate(task_list):
         route = routes[i]
         if route.error:
-            continue  # refused by its backend: no child; its result entry is the refusal
+            continue  # task refusal already has a route-local launch-policy diagnostic
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
         if _task_schema is not None:
@@ -509,6 +545,17 @@ def _build_children(
             child._live_transcript_path = str(_writer.path)
         if route.report() is not None:
             child._delegate_route = route.report()
+        from dataclasses import replace as dataclass_replace
+        from agent.delegation_launch import DelegationLaunchPolicy
+        policy = getattr(child, "_delegation_launch_policy", None)
+        if isinstance(policy, DelegationLaunchPolicy):
+            child.__dict__["_delegation_launch_policy"] = dataclass_replace(
+                policy, diagnostics=policy.freeze_diagnostics(route.diagnostics))
+            child.__dict__["_delegate_route_diagnostics"] = dict(route.diagnostics)
+            child.__dict__["_strict_reasoning_effort"] = policy.strict_reasoning
+            child.__dict__["_strict_requested_reasoning_effort"] = policy.reasoning_effort
+        elif route.diagnostics:
+            child.__dict__["_delegate_route_diagnostics"] = dict(route.diagnostics)
         if live_deleg_id:
             child._delegation_id = live_deleg_id
             _ident_ref = getattr(child, "_progress_identity_ref", None)
@@ -520,16 +567,13 @@ def _build_children(
 
 def _routes_for(task_list: list[dict[str, Any]], cfg: dict[str, Any], credentials_cfg: Optional[dict[str, Any]],
                 parent_agent: Any) -> tuple[list[Any], Optional[str]]:
-    """Per-task routes: an internal caller's explicit ``credentials_cfg`` (e.g. /review → auxiliary.review) owns
-    every task's route; otherwise the active delegation provider decides each one."""
     from tools.delegate_tool_routes import resolve_task_routes, route_for_config
-    if credentials_cfg is None:
-        return resolve_task_routes(task_list, cfg, parent_agent)
-    try:
-        route = route_for_config(credentials_cfg, parent_agent)
-    except ValueError as exc:
-        return [], str(exc)
-    return [route] * len(task_list), None
+    from tools.delegate_tool_validation import resolve_task_options
+    options, errors = resolve_task_options(task_list)
+    baseline = route_for_config(credentials_cfg, parent_agent) if credentials_cfg is not None else None
+    routes, error = resolve_task_routes(task_list, cfg, parent_agent, options=options, option_errors=errors,
+                                        base_route=baseline)
+    return routes, error
 
 
 def _settle_refused_transcripts(refused: list[dict[str, Any]], live_deleg_id: Optional[str], live_writers: list,
@@ -615,23 +659,23 @@ def delegate_task(
         )
     max_children = _get_max_concurrent_children()
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
-    if not err:
-        task_schemas, err = _coerce_task_schemas(task_list, output_schema)
-    if not err:
-        task_images, err = _coerce_task_images(task_list, images)
-    if not err:
-        # One route per task from the active delegation provider (delegation.backend), or from credentials_cfg
-        # (internal callers only, e.g. /review → auxiliary.review: a per-call routing owner shaped like the
-        # delegation section, kept together with its fallback policy through child construction). Explicit-pin
-        # preflight failures (e.g. pinned delegation.command missing from PATH) refuse the spawn loudly (#80450).
-        routes, err = _routes_for(task_list, cfg, credentials_cfg, parent_agent)
+    if err or task_list is None:
+        return tool_error(err or "No tasks provided.")
+    task_schemas, err = _coerce_task_schemas(task_list, output_schema)
+    if err:
+        return tool_error(err)
+    task_images, err = _coerce_task_images(task_list, images)
+    if err:
+        return tool_error(err)
+    routes, err = _routes_for(task_list, cfg, credentials_cfg, parent_agent)
     if err:
         return tool_error(err)
     # Fail closed per task: a task its backend cannot route is refused alone (its entry carries the error); the call
     # is a tool error only when no task can run.
     runnable = [r for r in routes if not r.error]
     if not runnable:
-        return tool_error(" ".join(dict.fromkeys(r.error for r in routes)))
+        reasons = [route.error for route in routes if route.error]
+        return tool_error(" ".join(dict.fromkeys(reason for reason in reasons if reason)))
     refused = [r.refused_entry(i) for i, r in enumerate(routes) if r.error]
     # Batch-level model/provider labels (transcript headers, completion block): blank when tasks took different
     # routes, so each child reports what it actually runs on.
@@ -840,6 +884,15 @@ DELEGATE_TASK_SCHEMA = {
                             "files do NOT belong here — put paths in 'context' instead.",
                             items={"type": "string"},
                         ),
+                        "profile": _p("string", "Run this task using the selected Hermes profile's saved route and credentials."),
+                        "model": _p("string", "Exact model ID or configured alias for this task; pins routing and disables model fallback."),
+                        "provider": _p("string", "Provider identity for this task; uses the selected baseline profile's saved default model if model is omitted."),
+                        "reasoning_effort": _p("string", "Exact Hermes reasoning level for this task, including none; unsupported explicit values refuse the task.",
+                                                enum=["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]),
+                        "system_prompt": _p("string", "Additional or replacement child persona instructions; semantics are applied by the child launch policy."),
+                        "system_prompt_mode": _p("string", "Persona mode: replace or append; valid only when system_prompt is supplied.", enum=["replace", "append"]),
+                        "tools": _p("array", "Exact child tool-name selection; omitted inherits the existing child grant, [] grants none.", items={"type": "string"}),
+                        "skills": _p("array", "Skill identifiers to preload from the child profile.", items={"type": "string"}),
                         "group": _p(
                             "string",
                             "Result-delivery bucket. Tasks sharing a group return together in ONE message once all of "

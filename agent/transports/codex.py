@@ -301,6 +301,7 @@ def _resolve_reasoning(model: str, params: dict[str, Any]) -> tuple[Any, bool]:
     """
     reasoning_effort, reasoning_enabled = "medium", True
     reasoning_config = params.get("reasoning_config")
+    strict = bool(params.get("strict_reasoning_effort"))
     if reasoning_config and isinstance(reasoning_config, dict):
         if reasoning_config.get("enabled") is False:
             reasoning_enabled = False
@@ -316,31 +317,70 @@ def _resolve_reasoning(model: str, params: dict[str, Any]) -> tuple[Any, bool]:
 
         # Grok 4.6 accepts xhigh; older Grok tops out at high.
         supported = XAI_GROK46_EFFORTS if is_grok_46_family(model) else XAI_LEGACY_EFFORTS
+        if strict:
+            return _strict_xai_reasoning(reasoning_effort, reasoning_enabled, supported)
     else:
-        base_url = params.get("base_url")
-        is_codex_backend = params.get("is_codex_backend") is True
-        # OpenAI's own origins have a known per-model ladder; a profile declaration speaks for
-        # endpoints the transport cannot know (a custom relay, a catalog-driven router), never
-        # for a ``custom:`` entry that merely points at api.openai.com.
-        declared = None
-        if not (is_codex_backend or _is_openai_api_origin(base_url)):
-            declared = _profile_declared_efforts(params.get("provider"), model, base_url)
-        supported = declared if declared is not None else _codex_efforts_for_route(
-            model, base_url, is_codex_backend=is_codex_backend)
+        supported = _reasoning_efforts_for_params(model, params)
         if not supported:
+            if strict:
+                raise ValueError(f"Explicit reasoning effort {reasoning_effort!r} cannot be carried by this route.")
             return None, False
+        if strict:
+            return _strict_route_reasoning(reasoning_effort, reasoning_enabled, supported)
     if not reasoning_enabled:
-        has_none = any(str(level).strip().lower() == "none" for level in supported)
-        if not has_none and model not in _UNPROJECTABLE_DISABLE_WARNED:
-            # #75227: report the unsupported configuration instead of silently falling back.
-            _UNPROJECTABLE_DISABLE_WARNED.add(model)
-            logger.warning(
-                "reasoning_effort: none cannot be sent for %s — its route accepts only %s, so the model's "
-                "default effort stays on (an omitted reasoning field does not disable it).",
-                model, ", ".join(str(level) for level in supported),
-            )
-        return ("none" if has_none else None), False
+        return _legacy_disabled_reasoning(model, supported)
     return clamp_effort(reasoning_effort, supported), reasoning_enabled
+
+
+def _reasoning_efforts_for_params(model: str, params: dict[str, Any]) -> tuple[str, ...]:
+    """Resolve the existing profile-declared or transport-known vocabulary for this route."""
+    base_url = params.get("base_url")
+    is_codex_backend = params.get("is_codex_backend") is True
+    # OpenAI's own origins have a known per-model ladder; a profile declaration speaks for
+    # endpoints the transport cannot know, never for a custom entry merely pointing there.
+    declared = None
+    if not (is_codex_backend or _is_openai_api_origin(base_url)):
+        declared = _profile_declared_efforts(params.get("provider"), model, base_url)
+    return declared if declared is not None else _codex_efforts_for_route(
+        model, base_url, is_codex_backend=is_codex_backend,
+    )
+
+
+def _strict_xai_reasoning(effort: Any, enabled: bool, supported: tuple[str, ...]) -> tuple[Any, bool]:
+    """Validate strict XAI vocabulary (whose declared disable token is exact lowercase)."""
+    if not enabled:
+        if "none" not in supported:
+            raise ValueError("Explicit reasoning effort 'none' cannot be carried by this route.")
+        return "none", False
+    if effort not in supported:
+        raise ValueError(f"Explicit reasoning effort {effort!r} cannot be carried by this route.")
+    return effort, True
+
+
+def _strict_route_reasoning(effort: Any, enabled: bool, supported: tuple[str, ...]) -> tuple[Any, bool]:
+    """Validate strict profile/Responses vocabulary without clamping or omission."""
+    if enabled:
+        if effort not in supported:
+            raise ValueError(f"Explicit reasoning effort {effort!r} cannot be carried by this route.")
+        return effort, True
+    has_none = any(str(level).strip().lower() == "none" for level in supported)
+    if not has_none:
+        raise ValueError("Explicit reasoning effort 'none' cannot be carried by this route.")
+    return "none", False
+
+
+def _legacy_disabled_reasoning(model: str, supported: tuple[str, ...]) -> tuple[Any, bool]:
+    """Keep historical warning-once and omit-unprojectable-disable behavior."""
+    has_none = any(str(level).strip().lower() == "none" for level in supported)
+    if not has_none and model not in _UNPROJECTABLE_DISABLE_WARNED:
+        # #75227: report the unsupported configuration instead of silently falling back.
+        _UNPROJECTABLE_DISABLE_WARNED.add(model)
+        logger.warning(
+            "reasoning_effort: none cannot be sent for %s — its route accepts only %s, so the model's "
+            "default effort stays on (an omitted reasoning field does not disable it).",
+            model, ", ".join(str(level) for level in supported),
+        )
+    return ("none" if has_none else None), False
 
 
 _EXTENDED_PROMPT_CACHE_MODELS = (
@@ -632,6 +672,27 @@ def _reasoning_fields(
     return fields
 
 
+def _validate_strict_reasoning_payload(kwargs: dict[str, Any], reasoning_config: Any) -> None:
+    """Ensure the final Responses body still carries one exact explicit effort value."""
+    if not isinstance(reasoning_config, dict):
+        return
+    expected = "none" if reasoning_config.get("enabled") is False else reasoning_config.get("effort")
+    if expected is None:
+        return
+    carriers = [kwargs]
+    extra_body = kwargs.get("extra_body")
+    if isinstance(extra_body, dict):
+        carriers.append(extra_body)
+    observed = []
+    for carrier in carriers:
+        reasoning = carrier.get("reasoning")
+        if isinstance(reasoning, dict) and "effort" in reasoning:
+            observed.append(reasoning["effort"])
+    if observed and all(value == expected for value in observed):
+        return
+    raise ValueError(f"Explicit reasoning effort {expected!r} cannot be carried exactly by the final Responses request.")
+
+
 class ResponsesApiTransport(ProviderTransport):
     """Transport for api_mode='codex_responses'."""
 
@@ -891,6 +952,8 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs["extra_body"].setdefault("prompt_cache_key", kwargs.get("prompt_cache_key", cache_key))
 
         _bound_prompt_cache_key_field(kwargs.get("extra_body"))
+        if params.get("strict_reasoning_effort"):
+            _validate_strict_reasoning_payload(kwargs, params.get("reasoning_config"))
         return kwargs
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:

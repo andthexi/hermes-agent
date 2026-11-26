@@ -39,12 +39,19 @@ from typing import Any, Mapping
 
 from agent.provider_base import ProviderBase
 
-#: Per-task property names core owns. A provider-declared parameter with one of these names is
-#: refused at schema-build time: plugins add parameters, they never redefine core ones, and the
-#: raw route fields (``provider``/``model``/``base_url``/``api_key``) never become model-facing.
+#: Core task-local child launch options are model-facing, but their schema and meaning remain
+#: core-owned. A backend may repeat only the exact core schema; raw route credentials and endpoint
+#: fields never become model-facing provider parameters.
+CORE_TASK_OPTION_FIELDS = frozenset({
+    "profile", "model", "provider", "reasoning_effort", "system_prompt", "system_prompt_mode", "tools", "skills",
+})
+
+#: Per-task property names core owns. The core launch options above are handled separately so exact
+#: compatible declarations can repeat them without becoming provider-owned parameters.
 RESERVED_TASK_PARAMETERS = frozenset({
     "goal", "context", "index", "output_schema", "images", "group", "role", "toolsets",
     "acp_command", "acp_args", "provider", "model", "base_url", "api_key", "api_mode",
+    "profile", "reasoning_effort", "system_prompt", "system_prompt_mode", "tools", "skills",
 })
 
 #: Keys a route may carry; anything else in a provider's answer is ignored.

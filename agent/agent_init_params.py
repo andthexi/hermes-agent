@@ -11,7 +11,7 @@ _PASSTHROUGH_PARAMS = (
     # Toolset filtering
     "enabled_toolsets", "disabled_toolsets",
     # Model response configuration (None = provider/model default)
-    "max_tokens", "reasoning_config", "service_tier",
+    "max_tokens", "reasoning_config", "service_tier", "strict_reasoning_effort", "delegation_launch_policy",
     "side_agent", "memory_agent_context",
 )
 # Gateway identity params stored as ``agent._<name>``. gateway_session_key is the stable

@@ -65,6 +65,7 @@ from tools.tool_result_storage import (
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 from hermes_cli.observability.shared_metrics_efficiency import note_tool_result, record_tool_batch
+from agent.delegation_launch import tool_grant_refusal, tool_grant_result
 
 # A tool result this large (raw stdout, file dumps) is the biggest allocation a turn ever drops.
 # The commit only flags it: the string is still referenced by the publish frames here, so the
@@ -384,6 +385,10 @@ def _canonical_tool_name(function_name: str) -> str:
     """Map legacy tool-name aliases BEFORE agent-loop dispatch."""
     from model_tools import _LEGACY_TOOL_ALIASES as _lta
 
+    from tools.thread_context import current_exact_tool_scope
+    exact_scope = current_exact_tool_scope()
+    if exact_scope is not None and function_name not in exact_scope:
+        return function_name
     return _lta.get(function_name, function_name)
 
 
@@ -407,7 +412,7 @@ def _unwrap_tool_search_call(
             return function_name, function_args, None
         underlying, underlying_args, err = _ts.resolve_underlying_call(function_args)
         if err or not underlying:
-            return function_name, function_args, None
+            return function_name, function_args, err
         if underlying == _ts.CONNECTOR_BATCH_SENTINEL:
             # Both executors retain the wrapper: scope/probe/hooks run per entry
             # in the batch dispatcher, not against a synthetic registry name.
@@ -416,6 +421,10 @@ def _unwrap_tool_search_call(
             # Session-gated GUI tools name their missing surface (#120413);
             # anything else keeps the generic block.
             return function_name, function_args, _ts.scope_block_reason(underlying)
+        from tools.thread_context import current_exact_tool_scope
+        exact_scope = current_exact_tool_scope()
+        if exact_scope is not None and underlying not in exact_scope:
+            return function_name, function_args, f"Tool name {underlying!r} is outside this task's exact tool grant."
         # Validate before unwrapping: the generic bridge hides the concrete
         # parameter schema from provider-native tool-call validation.
         scope_block = _ts.validate_deferred_call_args(underlying, underlying_args)
@@ -449,6 +458,10 @@ class _ParsedCall:
 
 
 def _parse_tool_call(agent, tool_call, *, flatten_probe: bool = False) -> _ParsedCall:
+    from tools.thread_context import exact_tool_name_block
+    if refusal := exact_tool_name_block(agent, tool_call.function.name):
+        args, error = _parse_tool_arguments(tool_call.function.arguments)
+        return _ParsedCall(tool_call, tool_call.function.name, args, [], error, refusal)
     name = _canonical_tool_name(tool_call.function.name)
     args, parse_error = _parse_tool_arguments(tool_call.function.arguments)
     scope_block = None
@@ -1346,6 +1359,10 @@ class _ConcurrentBatch:
         blocked = dispatched = False
         data_use: frozenset[str] = frozenset()
         try:
+            grant_result = tool_grant_result(agent, ref.name)
+            if grant_result is not None:
+                result, blocked, dispatched = grant_result, True, True
+                return _ToolOutcome(ref, result, 0.0, True, True)
             managed = _run_agent_tool_execution_middleware(
                 agent,
                 **ref.middleware_kwargs(),
@@ -1543,9 +1560,14 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
     failed flush (the caller must stop the batch)."""
     for i, pc in enumerate(batch.parsed_calls):
         r = batch.results[i]
+        ref = pc.ref(effective_task_id)
+        refusal = tool_grant_result(agent, ref.name)
         # A worker may finish between the deadline snapshot and this loop;
         # prefer its real result over a fabricated timeout.
-        if r is None:
+        if refusal is not None:
+            function_result, tool_duration = refusal, 0.0
+            is_error, blocked, effect_disposition = True, True, "none"
+        elif r is None:
             ref, is_error, blocked = pc.ref(effective_task_id), True, False
             function_result, tool_duration, effect_disposition = _unfinished_tool_result(
                 agent, ref, timed_out=i in batch.timed_out_indices, timeout_s=batch.timeout_s,
@@ -1575,6 +1597,10 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
     return True
 
 
+from tools.thread_context import exact_tool_scope_for_agent as _exact_tool_scope_for_agent
+
+
+@_exact_tool_scope_for_agent
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute tool calls concurrently; results are appended in original call order.
     ``finalize=False`` skips end-of-batch budget enforcement and /steer injection (the
@@ -1603,6 +1629,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # Resolved before the batch is built so the start-order gate can clamp under the deadline.
     timeout_s = _resolve_concurrent_tool_timeout()
     batch = _ConcurrentBatch(agent, messages, effective_task_id, parsed_calls, timeout_s)
+    for i, pc in enumerate(parsed_calls):
+        result = tool_grant_result(agent, pc.name, fallback=pc.scope_block)
+        if result is not None:
+            batch.results[i] = _ToolOutcome(pc.ref(effective_task_id), result, 0.0, True, True)
     agent._current_tool = tool_names_str
     agent._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
 
@@ -1856,6 +1886,7 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
     return True
 
 
+@_exact_tool_scope_for_agent
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     from types import SimpleNamespace
     from agent.terminal_approval_batch import terminal_approval_batch, terminal_approval_runs
@@ -1893,6 +1924,13 @@ def _execute_tool_calls_sequential(agent, assistant_message, messages: list, eff
 
         pc = _parse_tool_call(agent, tool_call, flatten_probe=True)
         ref = pc.ref(effective_task_id)
+        exact_result = tool_grant_result(agent, ref.name, fallback=pc.scope_block)
+        if exact_result is not None:
+            managed = _ManagedToolResult(exact_result, ref.args, ref.trace, True, True)
+            if not _publish_sequential_result(agent, messages, ref, managed, tool_duration=0.0,
+                                              index=i, budget=_tool_budget, transform_applied=True):
+                return
+            continue
         if pc.parse_error is not None:
             if not _append_invalid_arguments_result(agent, messages, ref, pc.parse_error):
                 return
@@ -1926,6 +1964,7 @@ def _execute_tool_calls_sequential(agent, assistant_message, messages: list, eff
         _finalize_tool_batch(agent, messages, effective_task_id, len(tool_calls), _tool_budget)
 
 
+@_exact_tool_scope_for_agent
 def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> None:
     """Execute a mixed batch as ordered parallel/sequential segments (the ``(kind, calls)``
     plan from ``_plan_tool_batch_segments``), preserving per-call result order and barrier

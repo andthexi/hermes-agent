@@ -347,6 +347,20 @@ def _auto_load_parts(agent: Any) -> list[str]:
     return [prompt] if prompt else []
 
 
+def _delegated_preload_parts(agent: Any) -> list[str]:
+    policy = getattr(agent, "_delegation_launch_policy", None)
+    if policy is None or policy.skills is None:
+        return []
+    if not hasattr(agent, "_delegation_preloaded_prompt"):
+        raise RuntimeError("Delegated skill preload snapshot was not initialized before prompt construction.")
+    missing = getattr(agent, "_delegation_preloaded_missing", ())
+    if missing:
+        details = "; ".join(f"{identifier}: {error}" for identifier, error in missing)
+        raise RuntimeError(f"Delegated skill preload is incomplete: {details}")
+    text = agent.__dict__["_delegation_preloaded_prompt"]
+    return [text] if text else []
+
+
 def _bot_mode_parts(agent: Any) -> list[str]:
     """Bot Mode teammate protocol — only in a bot's canonical "Bot Chat" session.
     Marks the prompt timeless (the volatile date line is dropped) since a birth
@@ -561,12 +575,21 @@ def _memory_parts(agent: Any) -> list[str]:
 
 
 def _identity_parts(agent: Any, ctx_len: Optional[int]) -> tuple[list[str], bool]:
-    """SOUL.md (primary identity; cron keeps the persona while skipping cwd
-    instructions, scoped to the agent's OWN home) or the default identity.
-    Returns ``(parts, soul_loaded)``."""
+    """SOUL.md (primary identity) or default identity, frozen per delegated child."""
+    policy = getattr(agent, "_delegation_launch_policy", None)
+    if policy is not None and policy.system_prompt is not None and policy.system_prompt_mode == "replace":
+        return [policy.system_prompt], policy.identity_soul_loaded
+    if policy is not None and policy.identity_snapshot is not None:
+        return [policy.identity_snapshot], policy.identity_soul_loaded
     wants_soul = agent.load_soul_identity or not agent.skip_context_files
     _soul_content = _pb.load_soul_md(ctx_len, home_override=_agent_home(agent)) if wants_soul else None
-    return ([_soul_content], True) if _soul_content else ([DEFAULT_AGENT_IDENTITY], False)
+    identity = _soul_content or DEFAULT_AGENT_IDENTITY
+    soul_loaded = bool(_soul_content)
+    if policy is not None:
+        from dataclasses import replace as dataclass_replace
+        agent.__dict__["_delegation_launch_policy"] = dataclass_replace(
+            policy, identity_snapshot=identity, identity_soul_loaded=soul_loaded)
+    return [identity], soul_loaded
 
 
 def _guidance_parts(agent: Any) -> list[str]:
@@ -761,6 +784,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _ctx_len = _cc_len if isinstance(_cc_len, int) and _cc_len > 0 else None
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts, _soul_loaded = _identity_parts(agent, _ctx_len)
+    identity_start = len(stable_parts)
+    policy = getattr(agent, "_delegation_launch_policy", None)
+    persona = policy.system_prompt if policy is not None else None
+    persona_mode = policy.system_prompt_mode if policy is not None else None
     # The skill_view() pointer dangles without skill tools OR without the
     # hermes-agent skill installed, so the variant is chosen after the skills
     # index is built; this slot holds its position.
@@ -774,6 +801,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         stable_parts[_help_guidance_slot] = HERMES_AGENT_HELP_GUIDANCE
     stable_parts.extend(_alibaba_identity_part(agent))
     # Pinned skills are per-agent constants (resolved once), so they live in the stable prefix.
+    stable_parts.extend(_delegated_preload_parts(agent))
     stable_parts.extend(_auto_load_parts(agent))
     # Coding posture: the operating brief stays in the stable prefix. The
     # environment block contains the current cwd/backend and belongs after
@@ -811,7 +839,24 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Embedder hints are prose too; reserve the delimiter for the renderer.
         environment_hints = environment_hints.replace(_pb.RUNTIME_ENVIRONMENT_HEADING, "> " + _pb.RUNTIME_ENVIRONMENT_HEADING)
         volatile_parts.append(f"{_pb.RUNTIME_ENVIRONMENT_HEADING}\n\n{environment_hints}\n\n{_pb.RUNTIME_ENVIRONMENT_END}")
-    return {"stable": _join_tier(stable_parts), "context": _join_tier(context_parts), "volatile": _join_tier(volatile_parts)}
+    stable = _join_tier(stable_parts)
+    if persona is not None and persona_mode == "replace":
+        scaffold_parts = list(stable_parts[identity_start:])
+        scaffold = _join_tier(list(scaffold_parts))
+        stable = "Task-specific persona instructions (replacing identity):\n" + persona
+        if scaffold:
+            stable += f"\n\n{scaffold}"
+    elif persona is not None and persona_mode == "append":
+        identity = _join_tier(list(stable_parts[:identity_start]))
+        if policy is not None and policy.identity_snapshot is not None:
+            identity = policy.identity_snapshot
+        scaffold = _join_tier(list(stable_parts[identity_start:]))
+        stable = identity
+        if persona:
+            stable += f"\n\nAdditional task-specific persona instructions:\n{persona}"
+        if scaffold:
+            stable += f"\n\n{scaffold}"
+    return {"stable": stable, "context": _join_tier(context_parts), "volatile": _join_tier(volatile_parts)}
 
 
 def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str:

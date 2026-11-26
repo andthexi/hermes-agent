@@ -30,6 +30,28 @@ _BUILD_KWARG_DEFAULTS = {
 }
 
 
+def _validate_strict_reasoning_payload(payload: dict[str, Any], reasoning_config: Any) -> None:
+    """Refuse Anthropic's categorical effort translations when strict mode asked for exact effort."""
+    if not isinstance(reasoning_config, dict):
+        return
+    requested = "none" if reasoning_config.get("enabled") is False else reasoning_config.get("effort", "medium")
+    requested = str(requested or "medium").strip().lower()
+    if requested == "none":
+        thinking = payload.get("thinking")
+        if isinstance(thinking, dict) and thinking.get("type") == "disabled":
+            return
+        raise ValueError("Explicit reasoning effort 'none' cannot be carried exactly by this Anthropic Messages route.")
+    output_config = payload.get("output_config")
+    if isinstance(output_config, dict):
+        observed = output_config.get("effort")
+        if observed == requested:
+            return
+        raise ValueError(f"Explicit reasoning effort {requested!r} cannot be carried exactly by this Anthropic Messages route.")
+    if isinstance(payload.get("thinking"), dict) and payload["thinking"].get("type") == "enabled":
+        raise ValueError(f"Explicit reasoning effort {requested!r} cannot be proven exactly by the manual Anthropic budget field.")
+    raise ValueError(f"Explicit reasoning effort {requested!r} cannot be carried exactly by this Anthropic Messages route.")
+
+
 class AnthropicTransport(ProviderTransport):
     """Transport for api_mode='anthropic_messages'."""
 
@@ -57,10 +79,13 @@ class AnthropicTransport(ProviderTransport):
     ) -> dict[str, Any]:
         """Build Anthropic messages.create() kwargs (converts messages and tools internally)."""
         from agent.anthropic_adapter import build_anthropic_kwargs
-        return build_anthropic_kwargs(
+        kwargs = build_anthropic_kwargs(
             model=model, messages=messages, tools=tools,
             **{key: params.get(key, default) for key, default in _BUILD_KWARG_DEFAULTS.items()},
         )
+        if params.get("strict_reasoning_effort") is True:
+            _validate_strict_reasoning_payload(kwargs, params.get("reasoning_config"))
+        return kwargs
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:
         """Parse content blocks (text/thinking/tool_use), map stop_reason, collect reasoning_details."""

@@ -24,7 +24,7 @@ from tools.skills_tool_setup import (
 from tools.skills_tool_plugin import (
     MAX_DESCRIPTION_LENGTH, MAX_NAME_LENGTH, _INJECTION_PATTERNS, _fail, _json,
     _mark_background_review_read, _preprocess_skill, _read_skill_text, _safe_frontmatter,
-    _serve_plugin_skill, _serve_skill_file, _truncate_description)
+    _plugin_skill_linked_files, _serve_plugin_skill, _serve_skill_file, _truncate_description)
 from tools.skills_tool_dedup import dedup_skill_view, reset_skill_view_dedup
 from tools.skill_provenance import is_background_review
 
@@ -195,13 +195,14 @@ def _parse_tags(tags_value) -> list[str]:
     return [t.strip().strip("\"'") for t in tags_value.split(",") if t.strip()]
 
 
-def _is_skill_disabled(*names: str, platform: str | None = None) -> bool:
+def _is_skill_disabled(*names: str, platform: str | None = None, non_activating: bool = False) -> bool:
     """Any of *names* disabled in config (one config load)? Platform precedence: explicit arg,
     ``HERMES_PLATFORM``, session ``HERMES_SESSION_PLATFORM``. A globally-disabled skill stays disabled on every platform
     (keep in sync with agent.skill_utils.get_disabled_skill_names)."""
     try:
-        from hermes_cli.config import load_config
-        skills_cfg = load_config().get("skills", {})
+        from hermes_cli.config import load_config, load_config_readonly
+        config = load_config_readonly() if non_activating else load_config()
+        skills_cfg = (config or {}).get("skills", {})
         resolved_platform = platform or os.getenv("HERMES_PLATFORM")
         if not resolved_platform:
             with suppress(Exception):
@@ -213,6 +214,8 @@ def _is_skill_disabled(*names: str, platform: str | None = None) -> bool:
         disabled = skills_cfg.get("disabled", [])
         return any((platform_disabled is not None and n in platform_disabled) or n in disabled for n in names)
     except Exception:
+        if non_activating:
+            raise
         return False
 
 
@@ -329,12 +332,88 @@ def _legacy_portable_skill_name(pm, namespace, bare):
                  if entry.get("plugin_key") in keys and entry.get("bare_name") == bare), None)
 
 
-def _resolve_plugin_skill(name, file_path, task_id, preprocess):
+def _serve_registered_preloaded_plugin_skill(pm, qualified: str, skill_md: Path) -> str:
+    """Build the raw canonical skill payload from an already-registered plugin path."""
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.plugins_content import plugin_skill_owners
+
+    plugin_cfg = (load_config_readonly() or {}).get("plugins", {})
+    disabled_cfg = plugin_cfg.get("disabled", []) if isinstance(plugin_cfg, dict) else []
+    enabled_cfg = plugin_cfg.get("enabled") if isinstance(plugin_cfg, dict) else None
+    disabled_cfg = disabled_cfg if isinstance(disabled_cfg, list) else []
+    owners = plugin_skill_owners(pm, qualified)
+    disabled = owners & set(disabled_cfg)
+    if disabled:
+        return _fail(f"Plugin '{sorted(disabled)[0]}' is disabled.")
+    if isinstance(enabled_cfg, list) and not owners.intersection(enabled_cfg):
+        return _fail(f"Plugin for skill '{qualified}' is not enabled.")
+    if not skill_md.is_file():
+        return _fail(f"Skill '{qualified}' file is unreadable or missing at {skill_md}.")
+    try:
+        content = _read_skill_text(skill_md)
+    except (OSError, UnicodeError) as exc:
+        return _fail(f"Failed to read skill '{qualified}' ({type(exc).__name__}).")
+    frontmatter = _safe_frontmatter(content=content)
+    if _is_skill_disabled(qualified, non_activating=True):
+        return _fail(f"Skill '{qualified}' is disabled.")
+    if not skill_matches_platform(frontmatter):
+        return _fail(f"Skill '{qualified}' is not supported on this platform.",
+                     readiness_status=SkillReadinessStatus.UNSUPPORTED.value)
+    if not (frontmatter.get("name") or skill_md.parent.name):
+        return _fail(f"Skill '{qualified}' has invalid skill metadata.")
+    metadata = frontmatter.get("metadata")
+    hermes_meta = metadata.get("hermes", {}) if isinstance(metadata, dict) else {}
+    hermes_meta = hermes_meta if isinstance(hermes_meta, dict) else {}
+    result = {
+        "success": True, "name": qualified, "description": str(frontmatter.get("description", "")),
+        "tags": _parse_tags(hermes_meta.get("tags") or frontmatter.get("tags", "")),
+        "related_skills": _parse_tags(hermes_meta.get("related_skills") or frontmatter.get("related_skills", "")),
+        "content": content, "path": str(skill_md), "skill_dir": str(skill_md.parent),
+        "linked_files": _plugin_skill_linked_files(skill_md.parent),
+        "readiness_status": "available", "setup_needed": False, "setup_skipped": False,
+    }
+    if frontmatter.get("compatibility"):
+        result["compatibility"] = frontmatter["compatibility"]
+    if isinstance(metadata, dict):
+        result["metadata"] = metadata
+    return _json(result)
+
+
+def _resolve_preloaded_plugin_skill(namespace: str, bare: str):
+    """Resolve qualified preload names only against profile-local registered metadata."""
+    from hermes_cli.plugins import get_plugin_manager
+
+    pm = get_plugin_manager()
+    if legacy := _legacy_portable_skill_name(pm, namespace, bare):
+        namespace, bare = legacy.split(":", 1)
+    qualified = f"{namespace}:{bare}"
+    if skill_md := pm.find_plugin_skill(qualified):
+        return _serve_registered_preloaded_plugin_skill(pm, qualified, skill_md), None
+    registered_plugin = any(
+        key == namespace or loaded.manifest.name == namespace
+        or loaded.manifest.data_namespace == namespace
+        for key, loaded in pm._plugins.items()
+    )
+    if registered_plugin or pm.list_plugin_skills(namespace):
+        return _fail(f"Skill '{bare}' not found in registered plugin '{namespace}'."), None
+    local_name = f"{namespace}/{bare}" if bare else None
+    if local_name:
+        roots, _ = skill_search_dirs()
+        local_exists = any((root / local_name / "SKILL.md").is_file()
+                           or (root / f"{local_name}.md").is_file() for _tier, root in roots)
+        if not local_exists:
+            return _fail(
+                f"Skill '{namespace}:{bare}' is not registered in the selected profile's already-loaded "
+                "plugin registry; plugin discovery/activation was not attempted, and no matching local "
+                f"skill '{local_name}' exists."), None
+    return None, local_name
+
+
+def _resolve_plugin_skill(name, file_path, task_id, preprocess, non_activating=False):
     """``plugin:skill`` dispatch: ``(result_json, None)`` when answered, else ``(None,
     local_category_name)`` to fall through to the flat-tree scan — categorized local skills also use
     ``category:skill`` in config/gateway prompts, so the on-disk ``category/skill`` form returns."""
     from agent.skill_utils import is_valid_namespace, parse_qualified_name
-    from hermes_cli.plugins import discover_plugins, get_plugin_manager
     namespace, bare = parse_qualified_name(name)
     if namespace == "plugin" and ":" in bare:
         # The skills index lists plugin skills under a "plugin" heading, and models write that
@@ -344,6 +423,9 @@ def _resolve_plugin_skill(name, file_path, task_id, preprocess):
         namespace, bare = parse_qualified_name(name)
     if not is_valid_namespace(namespace):
         return _fail(f"Invalid namespace '{namespace}' in '{name}'. Namespaces must match [a-zA-Z0-9_-]+."), None
+    if non_activating:
+        return _resolve_preloaded_plugin_skill(namespace, bare)
+    from hermes_cli.plugins import discover_plugins, get_plugin_manager
     discover_plugins()  # idempotent
     pm = get_plugin_manager()
     if legacy := _legacy_portable_skill_name(pm, namespace, bare):
@@ -524,6 +606,28 @@ def _skill_readiness(frontmatter: dict[str, Any], skill_name: str) -> tuple[dict
     return fields, extras
 
 
+def _non_activating_skill_readiness(frontmatter: dict[str, Any]) -> tuple[dict, dict]:
+    """Describe setup metadata without capturing secrets, probing files, or activating deps."""
+    from tools.skills_tool_setup import _get_required_environment_variables
+
+    required_env = _get_required_environment_variables(frontmatter)
+    required_files = frontmatter.get("required_credential_files") or []
+    declared_deps = frontmatter.get("deps") or []
+    if isinstance(declared_deps, str):
+        declared_deps = [declared_deps]
+    setup_needed = bool(required_env or required_files or declared_deps)
+    return ({
+        "required_environment_variables": required_env,
+        "required_commands": list(frontmatter.get("required_commands") or []),
+        "missing_required_environment_variables": [],
+        "missing_credential_files": [],
+        "missing_required_commands": [],
+        "setup_needed": setup_needed,
+        "setup_skipped": setup_needed,
+        "readiness_status": "setup_needed" if setup_needed else SkillReadinessStatus.AVAILABLE.value,
+    }, {})
+
+
 def _owning_search_dir(skill_md: Path, all_dirs) -> Optional[Path]:
     """Most specific search dir containing *skill_md*, compared lexically: a symlinked entry
     belongs to the root that exposes it, not to the root its target lives in."""
@@ -593,6 +697,11 @@ def _owned_relative(skill_dir: Optional[Path], skill_md: Path, all_dirs) -> str:
     return target.relative_to(root).as_posix() if root is not None else str(target)
 
 
+def _same_load_name_in_catalog(skill_md: Path, load_name: str) -> bool:
+    return any(entry["path"] == skill_md and entry["load_name"] == load_name
+               for entry in _skill_catalog(skip_disabled=True, include_hidden=True))
+
+
 def _log_security_warnings(name: str, skill_md: Path, content: str, all_dirs, active_skills_dir):
     """Warn (never block) when loaded from outside the trusted dirs (project + local + external)
     and/or when common prompt-injection patterns appear. The check is on the RESOLVED path:
@@ -610,8 +719,40 @@ def _log_security_warnings(name: str, skill_md: Path, content: str, all_dirs, ac
         logger.warning("Skill security warning for '%s': %s", name, "; ".join(warnings))
 
 
+def _local_skill_candidate(name: str, local_category_name: str | None):
+    roots, active_skills_dir = skill_search_dirs()
+    error, skill_dir, skill_md = locate_skill(name, local_category_name, roots)
+    return roots, active_skills_dir, error, skill_dir, skill_md
+
+
+def _read_local_skill(skill_md: Path, name: str, active_skills_dir: Path, all_dirs: list[Path],
+                      skill_dir: Path | None, non_activating: bool):
+    try:
+        content = _read_skill_text(skill_md)
+    except (OSError, UnicodeError) as exc:
+        message = (f"Failed to read skill '{name}' ({type(exc).__name__})." if non_activating
+                   else f"Failed to read skill '{name}': {exc}")
+        return None, _fail(message)
+    _log_security_warnings(name, skill_md, content, all_dirs, active_skills_dir)
+    frontmatter = _safe_frontmatter(content=content)
+    if not skill_matches_platform(frontmatter):
+        return None, _fail(f"Skill '{name}' is not supported on this platform.",
+                           readiness_status=SkillReadinessStatus.UNSUPPORTED.value)
+    resolved_name = frontmatter.get("name", skill_md.parent.name)
+    rel = _owned_relative(skill_dir, skill_md, all_dirs)
+    if non_activating:
+        disabled = _is_skill_disabled(resolved_name, rel, non_activating=True)
+    else:
+        disabled = _is_skill_disabled(resolved_name, rel)
+    if disabled and (non_activating or _is_skill_disabled(resolved_name)
+                     or _same_load_name_in_catalog(skill_md, rel)):
+        return None, _fail(f"Skill '{resolved_name}' is disabled. Enable it with `hermes skills` or inspect the files directly on disk.")
+    return (content, frontmatter, resolved_name), None
+
+
 def skill_view(
-    name: str, file_path: str | None = None, task_id: str | None = None, preprocess: bool = True) -> str:
+    name: str, file_path: str | None = None, task_id: str | None = None, preprocess: bool = True,
+    non_activating: bool = False) -> str:
     """View a skill (SKILL.md) or a file within its directory, as JSON. ``name`` is a skill name
     or path ("axolotl", "03-fine-tuning/axolotl"); "<plugin>:<skill>" resolves plugin-provided
     skills. ``preprocess`` applies the configured SKILL.md template / inline shell rendering;
@@ -623,33 +764,24 @@ def skill_view(
             return _fail(lookup_error, hint=_LOOKUP_HINT)
         local_category_name: str | None = None
         if ":" in name:  # plugin registry; bare names use the flat-tree scan below
-            served, local_category_name = _resolve_plugin_skill(name, file_path, task_id, preprocess)
+            served, local_category_name = _resolve_plugin_skill(
+                name, file_path, task_id, preprocess, non_activating=non_activating)
             if served is not None:
                 return served
         # The fall-through form (namespace/bare) joins onto each search dir too; re-validate it
         # since `bare` is not namespace-checked.
         if local_category_name and (lookup_error := skill_lookup_path_error(local_category_name)):
             return _fail(lookup_error, hint=_LOOKUP_HINT)
-        roots, active_skills_dir = skill_search_dirs()
+        roots, active_skills_dir, error, skill_dir, skill_md = _local_skill_candidate(name, local_category_name)
         all_dirs = [d for _t, d in roots]
-        error, skill_dir, skill_md = locate_skill(name, local_category_name, roots)
         if error is not None:
             return error
-        try:  # read once — reused for platform check and main content
-            content = _read_skill_text(skill_md)
-        except Exception as e:
-            return _fail(f"Failed to read skill '{name}': {e}")
-        _log_security_warnings(name, skill_md, content, all_dirs, active_skills_dir)
-        frontmatter = _safe_frontmatter(content=content)
-        if not skill_matches_platform(frontmatter):
-            return _fail(f"Skill '{name}' is not supported on this platform.", readiness_status=SkillReadinessStatus.UNSUPPORTED.value)
-        resolved_name = frontmatter.get("name", skill_md.parent.name)
-        # Disabled by declared name, or by the exact path that IS this copy's load name (a same-tier
-        # duplicate's row) — whatever alias reached it; an unrelated copy at that path elsewhere is not.
-        rel = _owned_relative(skill_dir, skill_md, all_dirs)
-        if _is_skill_disabled(resolved_name, rel) and (_is_skill_disabled(resolved_name) or any(
-                e["path"] == skill_md and e["load_name"] == rel for e in _skill_catalog(skip_disabled=True, include_hidden=True))):
-            return _fail(f"Skill '{resolved_name}' is disabled. Enable it with `hermes skills` or inspect the files directly on disk.")
+        assert skill_md is not None
+        skill, failure = _read_local_skill(skill_md, name, active_skills_dir, all_dirs, skill_dir, non_activating)
+        if failure is not None:
+            return failure
+        assert skill is not None
+        content, frontmatter, _resolved_name = skill
         if file_path and skill_dir:
             return _serve_skill_file(
                 skill_dir, file_path, name, list_available=True, mark_read=True,
@@ -659,13 +791,16 @@ def skill_view(
         hermes_meta = (metadata.get("hermes", {}) or {}) if isinstance(metadata, dict) else {}
         tags, related_skills = (
             _parse_tags(hermes_meta.get(k) or frontmatter.get(k, "")) for k in ("tags", "related_skills"))
-        linked_files = _skill_linked_files(skill_dir)
+        linked_files = _skill_linked_files(skill_dir) if skill_dir else {}
         try:
             rel_path = str(skill_md.relative_to(active_skills_dir))
         except ValueError:  # external skill — relative to its own parent dir
             rel_path = str(skill_md.relative_to(skill_md.parent.parent)) if skill_md.parent.parent else skill_md.name
         skill_name = frontmatter.get("name", skill_md.stem if not skill_dir else skill_dir.name)
-        readiness, readiness_extras = _skill_readiness(frontmatter, skill_name)
+        if non_activating:
+            readiness, readiness_extras = _non_activating_skill_readiness(frontmatter)
+        else:
+            readiness, readiness_extras = _skill_readiness(frontmatter, skill_name)
         rendered_content = content if not preprocess else _preprocess_skill(
             content, skill_dir, task_id, "Could not preprocess skill content for %s", skill_name)
         # ── pm tool deps (`deps: [ffmpeg]` frontmatter) ──────────────
@@ -674,7 +809,7 @@ def skill_view(
         # them. Failure never blocks the skill content — the note carries
         # the remedy.
         deps_note = None
-        declared_deps = frontmatter.get("deps") or []
+        declared_deps = [] if non_activating else frontmatter.get("deps") or []
         if isinstance(declared_deps, str):
             declared_deps = [declared_deps]
         if isinstance(declared_deps, list) and declared_deps:
@@ -705,7 +840,8 @@ def skill_view(
             **readiness_extras}
         if deps_note:
             result["deps_note"] = deps_note
-        _mark_background_review_read(skill_md)
+        if not non_activating:
+            _mark_background_review_read(skill_md)
         if frontmatter.get("compatibility"):  # agentskills.io optional fields
             result["compatibility"] = frontmatter["compatibility"]
         if isinstance(metadata, dict):

@@ -86,11 +86,17 @@ def _rpc_token_ok(request: dict, rpc_token: str) -> bool:
 
 def _handle_rpc_request(request: dict, *, allowed_tools: frozenset, tool_call_counter: list,
                         max_tool_calls: int, dispatch, tool_call_log: list, call_start: float,
-                        where: str) -> str:
+                        where: str, cell_authority=None) -> str:
     """Enforce allow-list + budget, then dispatch one authenticated request. Only a dispatched
     call consumes budget and is logged; refusals are free."""
     tool_name = request.get("tool", "")
     tool_args = request.get("args", {})
+    if cell_authority is not None:
+        if not cell_authority.active or not secrets.compare_digest(
+                str(request.get("cell_token") or "").encode(), cell_authority.token.encode()):
+            return tool_error("No active execute_code cell: RPC authority is absent or retired.")
+        if cell_authority.allowed_tools is not None and tool_name not in cell_authority.allowed_tools:
+            return tool_error(f"Tool '{tool_name}' is outside this execute_code cell's exact tool grant.")
     if tool_name not in allowed_tools:
         return tool_error(f"Tool '{tool_name}' is not available in execute_code. "
                           f"Available: {', '.join(sorted(allowed_tools))}")
@@ -138,7 +144,8 @@ def tool_errors_since(tool_call_log: list, start: int = 0) -> list:
 
 def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: list,
                      tool_call_counter: list, max_tool_calls: int, allowed_tools: frozenset,
-                     stop_event: threading.Event, rpc_token: str, dispatch=None):
+                     stop_event: threading.Event, rpc_token: str, dispatch=None,
+                     authority_getter=None):
     """Accept one client and serve newline-delimited JSON requests until it disconnects, idles
     300s, or the call limit is reached. ``tool_call_counter`` is a mutable ``[int]``. ``dispatch``
     overrides how an allowed, budgeted call runs: per-call sandboxes use the default (the thread
@@ -178,10 +185,11 @@ def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: li
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     resp = tool_error(f"Invalid RPC request: {exc}")
                 else:
+                    cell_authority = authority_getter() if authority_getter is not None else None
                     resp = _handle_rpc_request(
                         request, allowed_tools=allowed_tools, tool_call_counter=tool_call_counter,
                         max_tool_calls=max_tool_calls, dispatch=dispatch, tool_call_log=tool_call_log,
-                        call_start=call_start, where="sandbox",
+                        call_start=call_start, where="sandbox", cell_authority=cell_authority,
                     ) if _rpc_token_ok(request, rpc_token) else tool_error("Unauthorized RPC request")
                 conn.sendall((resp + "\n").encode())
     except TimeoutError:
@@ -198,11 +206,11 @@ def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: li
 
 def _rpc_poll_loop(env, rpc_dir: str, task_id: str, tool_call_log: list, tool_call_counter: list,
                    max_tool_calls: int, allowed_tools: frozenset, stop_event: threading.Event,
-                   rpc_token: str):
+                   rpc_token: str, *, cell_authority=None):
     """Poll the remote filesystem for request files and answer them. Background thread; each
     ``env.execute()`` is an independent process, so this is safe alongside the script-execution
     thread. Malformed or unauthorized requests are removed without a response."""
-    dispatch = _default_dispatch(task_id)
+    dispatch = cell_authority.dispatch if cell_authority is not None else _default_dispatch(task_id)
     poll_interval = 0.1
     quoted_rpc_dir = shlex.quote(rpc_dir)
     while not stop_event.is_set():
@@ -230,6 +238,10 @@ def _rpc_poll_loop(env, rpc_dir: str, task_id: str, tool_call_log: list, tool_ca
                     logger.debug("Unauthorized RPC request in %s", req_file)
                     env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
                     continue
+                if cell_authority is not None and not cell_authority.active:
+                    logger.debug("Retired cell RPC request in %s", req_file)
+                    env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
+                    continue
                 seq = request.get("seq", 0)
                 if not isinstance(seq, int):
                     # A non-int seq cannot form the res_NNNNNN name the caller
@@ -241,7 +253,7 @@ def _rpc_poll_loop(env, rpc_dir: str, task_id: str, tool_call_log: list, tool_ca
                 tool_result = _handle_rpc_request(
                     request, allowed_tools=allowed_tools, tool_call_counter=tool_call_counter,
                     max_tool_calls=max_tool_calls, dispatch=dispatch, tool_call_log=tool_call_log,
-                    call_start=call_start, where="remote sandbox",
+                    call_start=call_start, where="remote sandbox", cell_authority=cell_authority,
                 )
                 # Atomic (tmp + rename) and owner-only; results carry tool output
                 # on a shared-host backend.

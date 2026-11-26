@@ -54,39 +54,6 @@ from utils import base_url_host_matches, is_truthy_value
 logger = logging.getLogger("run_agent")
 
 
-def _provider_default_routes(provider: str) -> set[str]:
-    """Return known exact default routes for a canonical provider id."""
-    routes: set[str] = set()
-
-    def add(value):
-        route = normalize_route_base_url(value)
-        if route:
-            routes.add(route)
-
-    with suppress(Exception):
-        from hermes_cli.providers import HERMES_OVERLAYS, get_provider
-        overlay = HERMES_OVERLAYS.get(provider)
-        provider_def = get_provider(provider, allow_network=False)
-        add(getattr(overlay, "base_url_override", ""))
-        add(getattr(provider_def, "base_url", ""))
-
-    with suppress(Exception):
-        from providers import get_provider_profile
-        add(getattr(get_provider_profile(provider), "base_url", ""))
-
-    with suppress(Exception):
-        from hermes_cli.auth import PROVIDER_REGISTRY
-        from hermes_cli.models import normalize_provider as normalize_model_provider
-        from hermes_cli.providers import normalize_provider as normalize_registry_provider
-        for provider_id, config in PROVIDER_REGISTRY.items():
-            if normalize_registry_provider(normalize_model_provider(provider_id)) == provider:
-                add(getattr(config, "inference_base_url", ""))
-
-    if provider == "gemini":
-        routes.update(f"{route.rstrip('/')}/openai" for route in list(routes))
-    return routes
-
-
 def _context_route_mismatch(
     configured_base_url: Any, active_base_url: Any, configured_provider: Any, active_provider: Any,
     *, already_normalized: bool = False,
@@ -114,7 +81,8 @@ def _context_route_mismatch(
         active_provider = normalize_registry_provider(active_provider)
 
     if active_route:
-        configured_routes = _provider_default_routes(configured_provider)
+        from agent.delegation_launch import provider_default_routes
+        configured_routes = provider_default_routes(configured_provider)
         if configured_routes:
             return active_route not in configured_routes
         # Named/custom providers have no catalog default routes: an empty configured URL
@@ -1009,15 +977,14 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     from agent.delegation_backends import saved_backend
     from tools.registry import registry as _snapshot_registry
     agent._tool_snapshot_generation, agent._delegation_backend = _snapshot_registry._generation, saved_backend()
-    import model_tools
     from agent.oneshot_footprint import agent_is_oneshot
-    from toolsets import agent_tool_surface, session_disabled_toolsets, tool_selection_key
+    from toolsets import session_disabled_toolsets, tool_selection_key
     agent._configured_disabled_toolsets, disabled_toolsets = disabled_toolsets, session_disabled_toolsets(
         disabled_toolsets, getattr(agent, "platform", None), oneshot=agent_is_oneshot(agent))  # pin restore reads both
     agent.disabled_toolsets = disabled_toolsets  # so the tool_search bridge and delegate children drop them too
     agent._tool_snapshot_selection = tool_selection_key(enabled_toolsets, disabled_toolsets)  # tools[] freeze gate
-    agent.tools = agent_tool_surface(agent, model_tools.get_tool_definitions(
-        enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets, quiet_mode=agent.quiet_mode) or [])
+    from agent.delegation_launch import initialize_agent_tool_surface
+    initialize_agent_tool_surface(agent, enabled_toolsets, disabled_toolsets)
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()
     # Kanban guidance is session-static for the dispatcher-owned worker only. Profiles may
     # expose kanban_show interactively, and children/cron runs inherit the env var, without
@@ -1980,6 +1947,8 @@ def _inject_context_engine_tools(agent):
         and agent.tools is not None
         and (agent.enabled_toolsets is None or "context_engine" in agent.enabled_toolsets)
     ):
+        from agent.delegation_launch import task_tool_ceiling
+        exact_ceiling = task_tool_ceiling(agent)
         _existing_tool_names = {
             t.get("function", {}).get("name") for t in agent.tools if isinstance(t, dict)
         }
@@ -1996,6 +1965,8 @@ def _inject_context_engine_tools(agent):
                 )
                 continue
             _tname = _schema["name"]
+            if exact_ceiling is not None and _tname not in exact_ceiling:
+                continue
             if _tname in _existing_tool_names:
                 continue  # already registered via plugin/cache path
             agent.tools.append({"type": "function", "function": _schema})
@@ -2012,17 +1983,6 @@ def _inject_context_engine_tools(agent):
             )
         except Exception as _ce_err:
             _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
-
-
-def _init_usage_state(agent):
-    from agent.runtime_cwd import scope_terminal_cwd
-    # Prefer the session's explicitly adopted workspace (a Desktop session created under the
-    # spawn-time home pin records none; a picked/adopted one does — agent.session_cwd is set
-    # at build time and on every workspace move). TERMINAL_CWD is the launch fallback.
-    working_dir = getattr(agent, "session_cwd", None) or scope_terminal_cwd() or None
-    agent._subdirectory_hints = SubdirectoryHintTracker(
-        working_dir=working_dir, enabled=not agent.skip_context_files)
-    _set_defaults(agent, _USAGE_STATE)
 
 
 # Per-session usage accounting.
@@ -2053,6 +2013,14 @@ _USAGE_STATE: dict[str, Any] = {
 }
 
 
+def _init_usage_state(agent):
+    from agent.runtime_cwd import scope_terminal_cwd
+    working_dir = getattr(agent, "session_cwd", None) or scope_terminal_cwd() or None
+    agent._subdirectory_hints = SubdirectoryHintTracker(
+        working_dir=working_dir, enabled=not agent.skip_context_files)
+    _set_defaults(agent, _USAGE_STATE)
+
+
 def init_agent(
     agent, base_url: str | None = None, api_key: str | None = None, provider: str | None = None, api_mode: str | None = None,
     acp_command: str | None = None, acp_args: list[str] | None = None, command: str | None = None,
@@ -2078,7 +2046,8 @@ def init_agent(
     notice_callback: Callable[..., Any] | None = None, notice_clear_callback: Callable[..., Any] | None = None,
     event_callback: Optional[Callable[[str, dict], None]] = None,
     reaction_callback: Optional[Callable[[str], None]] = None, max_tokens: int | None = None,
-    reasoning_config: dict[str, Any] | None = None, service_tier: str | None = None,
+    reasoning_config: dict[str, Any] | None = None, service_tier: str | None = None, strict_reasoning_effort: bool = False,
+    delegation_launch_policy: Any = None,
     request_overrides: dict[str, Any] | None = None, prefill_messages: list[dict[str, Any]] | None = None,
     platform: str | None = None, user_id: str | None = None, user_id_alt: str | None = None, user_name: str | None = None,
     chat_id: str | None = None, chat_name: str | None = None, chat_type: str | None = None, thread_id: str | None = None,
@@ -2138,14 +2107,14 @@ def init_agent(
     agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
+
+    from agent.delegation_launch import enforce_tool_ceiling, initialize_launch_policy
+    initialize_launch_policy(agent, strict_reasoning_effort, reasoning_config, delegation_launch_policy)
     _resolve_api_mode(agent, api_mode, provider_name, base_url)
     _finalize_routing(agent, api_mode, credential_pool)
-
-    # Platform callbacks are stored under their parameter names verbatim.
     for _cb in _CALLBACK_PARAMS:
         setattr(agent, _cb, _params[_cb])
     agent.suppress_status_output = False
-
     _set_defaults(agent, _CONTROL_STATE)
 
     # Early config readers must reach the file handlers on first initialization.
@@ -2202,6 +2171,7 @@ def init_agent(
     _enforce_minimum_context(agent)
     _warn_nonagentic_hermes_model(agent)
     _inject_context_engine_tools(agent)
+    enforce_tool_ceiling(agent)
     _init_usage_state(agent)
     _clamp_compressor_to_ollama_num_ctx(agent)
     _emit_compression_summary(agent, cs)

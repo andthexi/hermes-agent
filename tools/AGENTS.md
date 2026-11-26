@@ -181,6 +181,8 @@ and Desktop process stop) and session close/reset end them. Depth>0 delegations 
 (`_model_background_value`), so a stop recurses through the child's own `_active_children` fan-out; an
 interrupted entry's `summary` is the child's last real assistant text (`_build_result_entry`). API: `website/docs/developer-guide/subagent-lifecycle-api.md`.
 
+**Delegation:** `tasks[]` options: `profile`, `model`, `provider`, `reasoning_effort`, `system_prompt`, `system_prompt_mode`, exact-name `tools`, preloaded `skills`; no top-level route/credential fields. Global `delegation.model/provider` remain defaults; omissions retain backend behavior; pins disable model/provider fallback. Enforce exact grants at runtime/bridges; not OS sandboxing. [Details](../website/docs/developer-guide/tools-runtime.md#delegated-task-launch-policy).
+
 ## Tests
 
 `tests/tools/`. Test the handler through the registry (real dispatch), not the bare function only;

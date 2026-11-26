@@ -1273,74 +1273,6 @@ def interruptible_api_call(agent, api_kwargs: dict):
     return _NonStreamRequest(agent, api_kwargs).run()
 
 
-def _consume_ephemeral_reasoning_off(agent) -> bool:
-    """Consume the one-shot "answer without thinking" continuation flag.
-
-    Set by the length-continuation path when a request returned reasoning but NO
-    visible content (thinking ate the output cap); continuation turns never replay
-    prior reasoning, so thinking ON would re-burn the budget. When True the caller
-    overrides the wire reasoning_config with ``{"enabled": False, "effort": "none"}``
-    for exactly the next call. Prompt-cache cost is bounded to ONE cold prefix write
-    on config-sensitive providers (Anthropic, OpenAI) — far cheaper than four futile
-    full-budget continuations.
-    """
-    consumed = bool(getattr(agent, "_ephemeral_reasoning_off", False))
-    if consumed:
-        agent._ephemeral_reasoning_off = False
-    return consumed
-
-
-def _reasoning_config_for_wire(agent):
-    """``agent.reasoning_config`` with the one-shot reasoning-off override applied.
-
-    Once the route has answered a disable with "reasoning is mandatory"
-    (``agent._reasoning_disable_rejected``), every disable — configured or
-    the one-shot continuation override — is dropped until the route
-    changes: the request goes out without a reasoning config and the route
-    applies its own default.
-    """
-    cfg = agent.reasoning_config
-    ephemeral_off = _consume_ephemeral_reasoning_off(agent)
-    if getattr(agent, "_reasoning_effort_rejected", False):
-        # The route rejected the configured reasoning LEVEL itself (#100536: ``reasoning.effort:
-        # max`` on an enabled config). Omit the reasoning fields until the route changes —
-        # the route default — as the auxiliary ladder does; resending would 400 identically.
-        agent._wire_reasoning_config = None
-        return None
-    if cfg is None:
-        # Unset effort: the profile's default (custom/OpenAI-compatible: medium) rather than the
-        # route's own, recorded below as what went out so a rejection of it lands in the branch above.
-        from agent.reasoning_params import unset_reasoning_default
-        cfg = unset_reasoning_default(agent)
-    if getattr(agent, "_reasoning_disable_rejected", False):
-        # The route rejects disables. Resend exactly what the session has
-        # been sending — the user's own config — so the retry lands on the
-        # same provider cache key as every prior request. Only a config that
-        # is itself a disable changes, and that session has never sent
-        # anything else, so nothing warm is lost: a route that said the
-        # disable is *mandatory-on* gets the floor effort (closest to what
-        # the user asked for); a relay that does not know the field gets
-        # nothing (route default).
-        if isinstance(cfg, dict) and (
-            cfg.get("enabled") is False or cfg.get("effort") == "none"
-        ):
-            if getattr(agent, "_reasoning_floor_required", False):
-                from agent.auxiliary_reasoning_floor import REASONING_FLOOR_EFFORT
-                floored = {**cfg, "enabled": True, "effort": REASONING_FLOOR_EFFORT}
-                agent._wire_reasoning_config = floored
-                return floored
-            agent._wire_reasoning_config = None
-            return None
-        agent._wire_reasoning_config = cfg
-        return cfg
-    if ephemeral_off:
-        cfg = {**(cfg or {}), "enabled": False, "effort": "none"}
-    # What actually went out: the reasoning-rejection rung reads it to tell a rejected
-    # disable (drop the disable) from a rejected level (drop the reasoning fields).
-    agent._wire_reasoning_config = cfg
-    return cfg
-
-
 def _alias_tool_search_bridge_for_xai(agent, transport, tools_for_api):
     """xAI chat-completions reserves ``tool_search`` and 400s when the bridge declares
     it (#95003): rename the wire declaration; ``normalize_response`` maps calls back
@@ -1386,7 +1318,8 @@ def _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config
         context_length=ctx_len.context_length if ctx_len else None,
         base_url=getattr(agent, "_anthropic_base_url", None),
         fast_mode=request_overrides.get("speed") == "fast",
-        drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)))
+        drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
+        strict_reasoning_effort=bool(getattr(agent, "_strict_reasoning_effort", False)))
     # Portal reads ``tags`` / ``session_id`` on its Messages route too, but the profile hook
     # is only consulted by the OpenAI-wire transport — merge here to keep sticky routing.
     return _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs, api_messages)
@@ -1396,7 +1329,8 @@ def _build_bedrock_kwargs(agent, api_messages, tools_for_api, reasoning_config):
     # Bedrock Converse — the adapter converts messages/tools and calls boto3 directly.
     return agent._get_transport().build_kwargs(model=agent.model, messages=api_messages, tools=tools_for_api,
         max_tokens=agent.max_tokens, region=getattr(agent, "_bedrock_region", None) or "us-east-1",
-        guardrail_config=getattr(agent, "_bedrock_guardrail_config", None), reasoning_config=reasoning_config)
+        guardrail_config=getattr(agent, "_bedrock_guardrail_config", None), reasoning_config=reasoning_config,
+        strict_reasoning_effort=bool(getattr(agent, "_strict_reasoning_effort", False)))
 
 
 def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id):
@@ -1430,6 +1364,7 @@ def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, re
         is_codex_backend=is_codex_backend, is_xai_responses=is_xai_responses,
         profile_reasoning=agent._endpoint_reasoning_payload() if endpoint.profile_reasoning else None,
         replay_encrypted_reasoning=bool(getattr(agent, "_codex_reasoning_replay_enabled", True)),
+        strict_reasoning_effort=bool(getattr(agent, "_strict_reasoning_effort", False)),
         context_management=context_management, text_verbosity=getattr(agent, "text_verbosity", None))
 
 
@@ -1466,6 +1401,7 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         provider_preferences=_prefs or None, openrouter_min_coding_score=agent.openrouter_min_coding_score,
         supports_reasoning=agent._supports_reasoning_extra_body(),
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
+        strict_reasoning_effort=bool(getattr(agent, "_strict_reasoning_effort", False)),
         qwen_session_metadata=_qwen_meta)
     if _profile:
         # Profiles handle per-provider quirks via hooks fed the context above.
@@ -1505,6 +1441,8 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
 def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     # One-shot continuation override — consumed exactly once, on the FIRST
     # request this call builds (only one api_mode branch runs per invocation).
+    from agent.reasoning_params import _reasoning_config_for_wire
+
     reasoning_config = _reasoning_config_for_wire(agent)
     if tools_for_api is None:
         tools_for_api = agent.tools

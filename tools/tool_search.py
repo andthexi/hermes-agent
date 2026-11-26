@@ -39,6 +39,39 @@ _MAX_QUERIES_PER_CALL = 7
 _MAX_DESCRIBE_NAMES_PER_CALL = 10
 
 
+def _exact_scope_names() -> frozenset[str] | None:
+    """Task-local exact permission overlay; None leaves ordinary bridge behavior unchanged."""
+    from tools.thread_context import current_exact_tool_scope
+    return current_exact_tool_scope()
+
+
+def _filter_exact_definitions(tool_defs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    scope = _exact_scope_names()
+    if scope is None:
+        return tool_defs
+    from agent.delegation_launch import effective_tool_ceiling
+    from tools.tool_search_catalog import BRIDGE_TOOL_NAMES
+    # Catalog discovery reveals explicitly granted concrete names only.
+    return [item for item in tool_defs if _fn(item).get("name") in scope]
+
+
+def _filter_exact_remote_entries(entries: list[list[CatalogEntry]]) -> list[list[CatalogEntry]]:
+    scope = _exact_scope_names()
+    if scope is None:
+        return entries
+    return [[entry for entry in group if entry.name in scope] for group in entries]
+
+
+def _exact_connector_description_scope() -> tuple[frozenset[str] | None, list[str]]:
+    """Connector literals allowed for this task and valid only when bridge names are explicit."""
+    scope = _exact_scope_names()
+    if scope is None:
+        return None, []
+    if TOOL_CALL_NAME not in scope or "manage_connections" not in scope:
+        return scope, []
+    return scope, [name for name in scope if is_connector_name(name)]
+
+
 @dataclass(frozen=True)
 class ToolSearchConfig:
     """Resolved, validated tool-search configuration for a single assembly."""
@@ -448,12 +481,30 @@ def dispatch_tool_search(args: dict[str, Any], *, current_tool_defs: list[dict[s
     raw_limit = args.get("limit")
     limit = (config.search_default_limit if raw_limit is None
              else _clamped_int(raw_limit, config.search_default_limit, 1, config.max_search_limit))
+    exact_scope = _exact_scope_names()
+    if exact_scope is not None and TOOL_SEARCH_NAME not in exact_scope:
+        return tool_error("Tool bridge 'tool_search' is outside this task's exact tool grant.")
+    current_tool_defs = _filter_exact_definitions(current_tool_defs)
     catalog = build_catalog(_deferrable_in(current_tool_defs))
+    if exact_scope is not None:
+        catalog = [entry for entry in catalog if entry.name in exact_scope]
     remote_entries: list[list[CatalogEntry]] = [[] for _ in queries]
     hosted_failure: Optional[str] = None
     if connections_in_scope(current_tool_defs):
-        remote_entries, hosted_failure = connector_entries_by_group(
-            queries, connector_search=connector_search, call=call)
+        exact_scope = _exact_scope_names()
+        connectors_for_scope = None
+        if exact_scope is not None:
+            _scope, permitted_connectors = _exact_connector_description_scope()
+            connectors_for_scope = permitted_connectors
+            if not permitted_connectors:
+                hosted_failure = None
+                remote_entries = [[] for _ in queries]
+        if exact_scope is None or connectors_for_scope:
+            remote_entries, hosted_failure = connector_entries_by_group(
+                queries, connector_search=connector_search, call=call)
+            if exact_scope is not None and connectors_for_scope is not None:
+                remote_entries = [[entry for entry in group if entry.name in connectors_for_scope]
+                                  for group in remote_entries]
     results: list[dict[str, Any]] = []
     tools_map: dict[str, dict[str, Any]] = {}
     available_sources = _available_source_summary(catalog)
@@ -502,15 +553,35 @@ def dispatch_tool_describe(args: dict[str, Any], *, current_tool_defs: list[dict
         retry_hint="Retry with fewer names per call.")
     if err:
         return err
-    deferrable = _deferrable_in(current_tool_defs)
+    exact_scope = _exact_scope_names()
+    if exact_scope is not None and TOOL_DESCRIBE_NAME not in exact_scope:
+        return tool_error("Tool bridge 'tool_describe' is outside this task's exact tool grant.")
+    current_tool_defs = _filter_exact_definitions(current_tool_defs)
+    raw_defs = current_tool_defs
+    scope = exact_scope
+    denied_names: list[str] = []
+    if scope is not None:
+        requested_names = list(names or ())
+        denied_names = [name for name in requested_names if not (
+            name in scope or (is_connector_name(name) and name in _exact_connector_description_scope()[1]))]
+        names = [name for name in requested_names if name not in denied_names]
+    defs = _filter_exact_definitions(current_tool_defs)
+    deferrable = _deferrable_in(defs)
     by_name = {name: _fn(td) for td, name in zip(deferrable, _tool_def_names(deferrable)) if name}
-    remote_schemas, hosted_failure = remote_schemas_for(names, current_tool_defs, connector_describe, call=call)
+    exact_scope = _exact_scope_names()
+    if exact_scope is None:
+        allowed_remote_names = [name for name in names if is_connector_name(name)]
+    else:
+        _scope, permitted_connectors = _exact_connector_description_scope()
+        allowed_remote_names = [name for name in names if name in permitted_connectors]
+    remote_schemas, hosted_failure = remote_schemas_for(allowed_remote_names, raw_defs,
+                                                        connector_describe, call=call)
 
     tools: dict[str, dict[str, Any]] = {}
     not_found: list[str] = []
     undescribed: list[str] = []
-    errors: dict[str, str] = {}
-    session_names = session_tool_names(current_tool_defs)
+    errors: dict[str, str] = {name: "Tool name is outside this task's exact tool grant." for name in denied_names}
+    session_names = session_tool_names(raw_defs)
     for name in names:
         fn = by_name.get(name)
         remote_fn = remote_schemas.get(name)
@@ -603,6 +674,10 @@ def resolve_underlying_call(args: dict[str, Any], session_tool_names: Optional[I
 
     if len(entries) > 1 and any(not is_connector_name(e["name"]) for e in entries):
         return None, {}, local_batch_error(entries)
+    exact_scope = _exact_scope_names()
+    if exact_scope is not None and is_connector_name(entries[0]["name"]):
+        if TOOL_CALL_NAME not in exact_scope or "manage_connections" not in exact_scope:
+            return None, {}, "Connector bridge use requires explicit tool_call and manage_connections grants."
     if is_connector_name(entries[0]["name"]):
         return CONNECTOR_BATCH_SENTINEL, {"calls": entries}, None
 
@@ -613,6 +688,8 @@ def resolve_underlying_call(args: dict[str, Any], session_tool_names: Optional[I
         return None, {}, unavailable
     if not is_deferrable_tool_name(name, load_config_readonly().effective_defer_tools):
         return None, {}, not_deferrable_error(name, session_tool_names)
+    if exact_scope is not None and name not in exact_scope:
+        return None, {}, f"Tool name {name!r} is outside this task's exact tool grant."
     return name, raw_args, None
 
 

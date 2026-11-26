@@ -225,17 +225,20 @@ def _live_tool_defs_entry(cache_key: tuple) -> Optional[list[dict[str, Any]]]:
 
 
 def get_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_toolsets: Optional[list[str]] = None,
-                         quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> list[dict[str, Any]]:
+                         quiet_mode: bool = False, skip_tool_search_assembly: bool = False,
+                         update_last_resolved_tool_names: bool = True) -> list[dict[str, Any]]:
     """Tool definitions for model API calls, filtered by toolset.
 
     enabled_toolsets None = all; disabled_toolsets are subtracted after enabling.
     quiet_mode suppresses status prints and enables memoization.
     skip_tool_search_assembly returns raw schemas for every enabled tool — only
     the tool_search bridge should use it (it reads the real, uncollapsed catalog).
+    update_last_resolved_tool_names=False makes this a read-only surface lookup.
     """
     def compute():
         return _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                         skip_tool_search_assembly=skip_tool_search_assembly)
+                                         skip_tool_search_assembly=skip_tool_search_assembly,
+                                         update_last_resolved_tool_names=update_last_resolved_tool_names)
     if not quiet_mode:
         return compute()
     cache_key = _tool_defs_cache_key(enabled_toolsets, disabled_toolsets, skip_tool_search_assembly)
@@ -246,11 +249,28 @@ def get_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_
     # Mirrors the cache-hit path above. (issue #17335) Bound the cache with LRU eviction so a long-lived
     # Gateway process doesn't accumulate entries unboundedly across the many distinct toolset/config
     # fingerprints it sees over its lifetime (#19251).
+    global _last_resolved_tool_names
     with _tool_defs_cache_lock:
         cached = _live_tool_defs_entry(cache_key) if cache_key is not None else None
+    if not update_last_resolved_tool_names:
+        with check_fn_verdict_window() as verdict_expiry:
+            result = compute()
+        if cache_key is None:
+            return list(result)
+        with _tool_defs_cache_lock:
+            cached = _live_tool_defs_entry(cache_key)
+            if cached is None:
+                if cache_key not in _tool_defs_cache and len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
+                    evicted = next(iter(_tool_defs_cache))
+                    _tool_defs_cache.pop(evicted)
+                    _tool_defs_expiry.pop(evicted, None)
+                _tool_defs_cache[cache_key] = cached = result
+                _tool_defs_expiry[cache_key] = verdict_expiry[0]
+        return list(cached)
     if cached is None:
         with check_fn_verdict_window() as verdict_expiry:
             result = compute()
+        _last_resolved_tool_names = [t["function"]["name"] for t in result]
         if cache_key is None:
             return list(result)
         with _tool_defs_cache_lock:
@@ -262,8 +282,7 @@ def get_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_
                     _tool_defs_expiry.pop(evicted, None)
                 _tool_defs_cache[cache_key] = cached = result
                 _tool_defs_expiry[cache_key] = verdict_expiry[0]
-    else:
-        global _last_resolved_tool_names
+    elif update_last_resolved_tool_names:
         _last_resolved_tool_names = [t["function"]["name"] for t in cached]
     # Always a shallow copy: run_agent appends memory/LCM schemas to its list; a
     # shared list would accumulate duplicate names (HTTP 400 from DeepSeek/Kimi/MiMo).
@@ -365,11 +384,16 @@ def _fn_def(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def _rewrite_execute_code(td: dict[str, Any], available: set) -> Optional[dict[str, Any]]:
-    """List only sandbox tools that are actually available."""
+    """List only sandbox tools available to this session and exact task grant."""
     # Without this, the model sees "web_search is available in execute_code" even when the API key isn't
     # configured or the toolset is disabled (#560-discord).
     from tools.code_execution_tool import SANDBOX_ALLOWED_TOOLS, build_execute_code_schema, _get_execution_mode
-    return _fn_def(build_execute_code_schema(SANDBOX_ALLOWED_TOOLS & available, mode=_get_execution_mode()))
+    sandbox_tools = SANDBOX_ALLOWED_TOOLS & available
+    from tools.thread_context import current_exact_tool_scope
+    exact_scope = current_exact_tool_scope()
+    if exact_scope is not None:
+        sandbox_tools &= exact_scope
+    return _fn_def(build_execute_code_schema(sandbox_tools, mode=_get_execution_mode()))
 
 
 def _discord_rewriter(schema_fn_name: str):
@@ -520,19 +544,22 @@ _TOOL_SEARCH_LISTING_FORMS = {
 
 
 def _compute_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_toolsets: Optional[list[str]] = None,
-                              quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> list[dict[str, Any]]:
+                              quiet_mode: bool = False, skip_tool_search_assembly: bool = False,
+                              update_last_resolved_tool_names: bool = True) -> list[dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
+    global _last_resolved_tool_names
     tools_to_include = _select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode)
     # Selection is per schema, not per process/profile. Kanban's local checks
     # are uncached; the outer definitions cache already keys on this selection.
     from tools.kanban_toolset_context import scoped_kanban_toolset_selection
     with scoped_kanban_toolset_selection(enabled_toolsets):
         filtered_tools = _apply_dynamic_schemas(registry.get_definitions(tools_to_include, quiet=quiet_mode))
-    global _last_resolved_tool_names
-    _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
+    names = [t["function"]["name"] for t in filtered_tools]
+    if update_last_resolved_tool_names:
+        _last_resolved_tool_names = names
 
     if not quiet_mode:
-        print(f"🛠️  Final tool selection ({len(filtered_tools)} tools): {', '.join(_last_resolved_tool_names)}"
+        print(f"🛠️  Final tool selection ({len(filtered_tools)} tools): {', '.join(names)}"
               if filtered_tools else "🛠️  No tools selected (all filtered out or unavailable)")
     # Normalize schema shapes llama.cpp's grammar converter rejects (bare
     # "type": "object", string-valued nodes from malformed MCP servers).
@@ -736,14 +763,32 @@ def _dispatch_bridge_tool(function_name: str, function_args: dict[str, Any],
         return None
     if not ts.is_bridge_tool(function_name):
         return None
+    from tools.thread_context import current_exact_tool_scope
+    exact_scope = current_exact_tool_scope()
+    if exact_scope is not None and function_name not in exact_scope:
+        return tool_error("Tool bridge is outside this task's exact tool grant."), None
     # Un-collapsed catalog scoped to the session's toolsets, so a restricted
     # session (subagent, kanban worker) can't reach the whole registry via the bridge.
     try:
         current_defs = get_tool_definitions(enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
-                                            quiet_mode=True, skip_tool_search_assembly=True) or []
+                                            quiet_mode=True, skip_tool_search_assembly=True,
+                                            update_last_resolved_tool_names=False) or []
     except Exception:
         current_defs = []
     args = function_args or {}
+    if exact_scope is not None:
+        # Bridge schemas are independently granted; only exact concrete names form the corpus.
+        from tools.tool_search_catalog import BRIDGE_TOOL_NAMES
+        concrete_scope = exact_scope - BRIDGE_TOOL_NAMES
+        current_defs = [item for item in current_defs
+                        if item.get("function", {}).get("name") in concrete_scope]
+        if not exact_scope:
+            return tool_error("This task has an empty exact tool grant; deferred and connector access are denied."), None
+        if function_name in {"tool_search", "tool_describe", "tool_call"}:
+            from tools.connectors import is_connector_name
+            has_connector = any(is_connector_name(name) for name in exact_scope)
+            if has_connector and ("tool_call" not in exact_scope or "manage_connections" not in exact_scope):
+                return tool_error("Connector bridge use requires explicit tool_call and manage_connections grants."), None
     from tools.managed_gateway_identity import CallRef
     call = CallRef(turn_id=ids.turn_id, tool_call_id=ids.tool_call_id) if ids else None
     if function_name == ts.TOOL_SEARCH_NAME:
@@ -911,6 +956,20 @@ def handle_function_call(
     it (single-fire contract). enabled/disabled_toolsets scope the Tool Search
     bridge catalog to this session's grant (None = unrestricted).
     """
+    # Check the caller's literal name before compatibility aliases or schema coercion.
+    # Strict children cannot turn an ungranted literal into a granted canonical tool.
+    from tools.thread_context import exact_tool_refusal
+    if refusal := exact_tool_refusal(function_name):
+        if refusal.startswith("Tool call refused: this child was launched with an empty tool grant;"):
+            refusal = "Tool call refused: this task has an empty exact tool grant; no tools are permitted."
+        start = time.monotonic()
+        result = tool_error(refusal)
+        _emit_post_tool_call_hook(function_name=function_name, function_args=function_args, result=result,
+                                  task_id=task_id, session_id=session_id, tool_call_id=tool_call_id,
+                                  turn_id=turn_id, api_request_id=api_request_id,
+                                  conversation_id=conversation_id, duration_ms=_elapsed_ms(start),
+                                  middleware_trace=list(tool_request_middleware_trace or []))
+        return result
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
@@ -924,6 +983,12 @@ def handle_function_call(
         _emit_post_tool_call_hook(function_name=function_name, function_args=function_args, result=result,
                                   **asdict(ids), middleware_trace=list(trace), **extra)
         return result
+
+    # Guard the public dispatcher entry too; this catches bridge names before
+    # wrapper routing and catches direct local callers outside the agent executor.
+    from tools.thread_context import exact_tool_refusal
+    if refusal := exact_tool_refusal(function_name):
+        return _emit(tool_error(refusal), duration_ms=_elapsed_ms(start))
 
     # Tool Search bridge: tool_search / tool_describe are catalog reads handled
     # inline; tool_call is unwrapped so every downstream hook (pre/post, edit

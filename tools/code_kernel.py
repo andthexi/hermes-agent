@@ -56,6 +56,13 @@ def run_cell(request, execution_count):
     """Exec one cell; returns (response payload, FULL stdout text)."""
     out, err = io.StringIO(), io.StringIO()
     status, trace = "ok", ""
+    cell_token = request.get("cell_token", "")
+    os.environ["HERMES_RPC_CELL_TOKEN"] = cell_token
+    tools_module = sys.modules.get("hermes_tools")
+    if tools_module is None and "hermes_tools" in GLOBALS:
+        tools_module = GLOBALS["hermes_tools"]
+    if tools_module is not None and hasattr(tools_module, "_cell_token"):
+        tools_module._cell_token.set(cell_token)
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             exec(compile(request["code"], "<cell>", "exec"), GLOBALS)
@@ -204,11 +211,20 @@ class CellAuthority:
     refused instead of running under a stale approval/session/turn identity.
     """
 
-    def __init__(self, task_id: str):
+    def __init__(self, task_id: str, allowed_tools: Optional[frozenset[str]] = None,
+                 token: Optional[str] = None):
         import contextvars
+        import threading
         self.task_id = task_id
+        exact_tools = None if allowed_tools is None else frozenset(allowed_tools)
+        from tools.thread_context import current_exact_tool_scope
+        exact_scope = current_exact_tool_scope()
+        self.allowed_tools = (exact_tools if exact_scope is None else
+                              exact_scope if exact_tools is None else exact_tools & exact_scope)
+        self.token = token or secrets.token_urlsafe(24)
         self.ctx = contextvars.copy_context()
         self.active = True
+        self._lock = threading.RLock()
         # ((getter, setter), captured value) per thread-local prompt callback (approval, sudo, vault unlock…)
         self._callbacks: list = []
         try:
@@ -219,15 +235,19 @@ class CellAuthority:
             self._callbacks = []
 
     def retire(self) -> None:
-        self.active = False
+        with self._lock:
+            self.active = False
 
     def dispatch(self, tool_name: str, tool_args: dict) -> str:
         """Run one tool call under THIS cell's context and callbacks."""
         from tools.registry import tool_error
-        if not self.active:
-            return tool_error("No active execute_code cell: the cell this kernel call "
-                              "belonged to has settled, so its tool authority is retired.")
-        return self.ctx.run(self._invoke, tool_name, tool_args)
+        with self._lock:
+            if not self.active:
+                return tool_error("No active execute_code cell: the cell this kernel call "
+                                  "belonged to has settled, so its tool authority is retired.")
+            if self.allowed_tools is not None and tool_name not in self.allowed_tools:
+                return tool_error(f"Tool '{tool_name}' is outside this execute_code cell's exact tool grant.")
+            return self.ctx.copy().run(self._invoke, tool_name, tool_args)
 
     def _invoke(self, tool_name: str, tool_args: dict) -> str:
         from model_tools import handle_function_call
@@ -240,7 +260,9 @@ class CellAuthority:
             except Exception:
                 previous = None
         try:
-            return handle_function_call(tool_name, tool_args, task_id=self.task_id)
+            from tools.thread_context import exact_tool_scope
+            with exact_tool_scope(self.allowed_tools):
+                return handle_function_call(tool_name, tool_args, task_id=self.task_id)
         finally:
             if previous is not None:
                 try:
@@ -303,6 +325,9 @@ class SessionKernel:
 
     def teardown(self) -> None:
         self.stop_event.set()
+        if self.cell_authority is not None:
+            self.cell_authority.retire()
+            self.cell_authority = None
         if self.alive():
             from tools.code_execution_tool import _kill_process_group
             _kill_process_group(self.proc, escalate=True)
@@ -455,7 +480,7 @@ def _rpc_forever(kernel: SessionKernel, max_tool_calls: int,
     while not kernel.stop_event.is_set():
         _rpc_server_loop(kernel.server_sock, "", kernel.tool_call_log, kernel.tool_call_counter,
                          max_tool_calls, sandbox_tools, kernel.stop_event, kernel.rpc_token,
-                         dispatch=_dispatch)
+                         dispatch=_dispatch, authority_getter=lambda: kernel.cell_authority)
 
 
 def _stdout_reader(kernel: SessionKernel) -> None:
@@ -810,6 +835,8 @@ def execute_in_session_kernel(
 ) -> str:
     """Run one cell in the (owner, mode, python, cwd, tools) session kernel. The owner is the
     session key (``_resolve_owner``), not the per-turn task id, so state survives across turns."""
+    from tools.code_execution_tool import _intersect_sandbox_helpers
+    sandbox_tools = _intersect_sandbox_helpers(sandbox_tools)
     key = (_resolve_owner(task_id) or "", mode, child_python, child_cwd, tuple(sorted(sandbox_tools)))
     exec_start = time.monotonic()
     from agent.delegation_context import is_delegated_child_context
@@ -835,7 +862,7 @@ def _run_cell(kernel: SessionKernel, key: tuple, code: str, *, task_id: str, chi
     reused = kernel.proc is not None
     # Captured on the calling thread BEFORE the cell runs (the snapshot a per-call RPC thread
     # would get) and installed on the kernel so RPC dispatches under THIS cell's identity.
-    authority = CellAuthority(task_id)
+    authority = CellAuthority(task_id, sandbox_tools)
     with kernel.lock:
         try:
             if kernel.proc is None:
@@ -847,7 +874,8 @@ def _run_cell(kernel: SessionKernel, key: tuple, code: str, *, task_id: str, chi
             kernel.cell_log_start = len(kernel.tool_call_log)
             kernel.raw.drain(), kernel.stderr.drain()  # raw output leaked between cells belongs to no cell
             kernel.cell_authority = authority
-            kernel.proc.stdin.write((json.dumps({"id": uuid.uuid4().hex, "code": code}) + "\n").encode("utf-8"))
+            kernel.proc.stdin.write((json.dumps({"id": uuid.uuid4().hex, "code": code,
+                                                "cell_token": authority.token}) + "\n").encode("utf-8"))
             kernel.proc.stdin.flush()
             status, payload = _await_cell(kernel, timeout, is_interrupted)
             result = _cell_result(

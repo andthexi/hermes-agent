@@ -24,7 +24,6 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from tools.thread_context import propagate_context_to_thread
 from tools.registry import registry, tool_error
 
 from hermes_time import get_timezone_name
@@ -249,9 +248,10 @@ def retry(fn, max_attempts=3, delay=2):
 
 _UDS_TRANSPORT_HEADER = '''\
 """Auto-generated Hermes tools RPC stubs."""
-import json, os, socket, shlex, threading, time
+import json, os, socket, shlex, threading, time, contextvars
 
 _sock = None
+_cell_token = contextvars.ContextVar("hermes_rpc_cell_token", default=os.environ.get("HERMES_RPC_CELL_TOKEN", ""))
 # The RPC server handles a single client connection serially and has no
 # request-id in the protocol, so concurrent _call() invocations from multiple
 # threads (e.g. ThreadPoolExecutor) would race on the shared socket and get
@@ -290,6 +290,7 @@ def _call(tool_name, args):
         "tool": tool_name,
         "args": args,
         "token": os.environ.get("HERMES_RPC_TOKEN", ""),
+        "cell_token": _cell_token.get(),
     }) + "\\n"
     # Session kernels outlive the RPC server's 300s idle window, so their
     # connection can be legitimately gone by the next cell. The server
@@ -334,9 +335,10 @@ def _call(tool_name, args):
 
 _FILE_TRANSPORT_HEADER = '''\
 """Auto-generated Hermes tools RPC stubs (file-based transport)."""
-import json, os, shlex, tempfile, threading, time
+import json, os, shlex, tempfile, threading, time, contextvars
 
 _RPC_DIR = os.environ.get("HERMES_RPC_DIR") or os.path.join(tempfile.gettempdir(), "hermes_rpc")
+_cell_token = contextvars.ContextVar("hermes_rpc_cell_token", default=os.environ.get("HERMES_RPC_CELL_TOKEN", ""))
 _seq = 0
 # `_seq += 1` is not atomic (read-modify-write), so concurrent _call()
 # invocations from multiple threads could allocate the same sequence number
@@ -368,6 +370,7 @@ def _call(tool_name, args):
             "args": args,
             "seq": seq,
             "token": os.environ.get("HERMES_RPC_TOKEN", ""),
+            "cell_token": _cell_token.get(),
         }, f)
     os.rename(tmp, req_file)
 
@@ -588,8 +591,27 @@ def _finish_remote_kernel_result(kernel_result: dict[str, Any], *,
 
 
 def _sandbox_tools_for(enabled_tools: Optional[list[str]]) -> frozenset:
-    """Enabled ∩ SANDBOX_ALLOWED_TOOLS, or every sandbox tool when the intersection is empty."""
-    return frozenset(SANDBOX_ALLOWED_TOOLS & set(enabled_tools or ())) or SANDBOX_ALLOWED_TOOLS
+    """Resolve the effective RPC helper grant without widening empty intersections.
+
+    ``None`` is the legacy caller default (all helpers); an explicit empty list is
+    a deny-all. An exact task scope, when present, always intersects that surface.
+    """
+    selected = SANDBOX_ALLOWED_TOOLS if enabled_tools is None else set(enabled_tools)
+    return _intersect_sandbox_helpers(selected)
+
+
+def _intersect_sandbox_helpers(helpers) -> frozenset:
+    """Apply the current task's exact-tool ceiling to an already selected helper set."""
+    from tools.thread_context import current_exact_tool_scope
+    exact_scope = current_exact_tool_scope()
+    selected = set(helpers) & SANDBOX_ALLOWED_TOOLS
+    if exact_scope is not None:
+        selected &= exact_scope
+    elif helpers and not selected:
+        # Preserve the legacy fallback only for unrestricted callers; an exact empty
+        # grant never reaches this branch and therefore cannot widen into helpers.
+        selected = set(SANDBOX_ALLOWED_TOOLS)
+    return frozenset(selected)
 
 
 def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
@@ -597,9 +619,14 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
                          exec_start: float) -> str:
     """Per-call script ship: stage hermes_tools.py + script.py in a fresh remote sandbox dir,
     serve file-RPC from a polling thread, run, clean up."""
+    from tools.code_kernel import CellAuthority
+    from tools.thread_context import current_exact_tool_scope, propagate_context_to_thread
     sandbox_dir = f"{_env_temp_dir(env)}/hermes_exec_{uuid.uuid4().hex[:12]}"
     quoted_sandbox_dir = shlex.quote(sandbox_dir)
     tool_call_counter, tool_call_log, stop_event, rpc_thread = [0], [], threading.Event(), None
+    exact_scope = current_exact_tool_scope()
+    authority_tools = sandbox_tools if exact_scope is None else sandbox_tools & exact_scope
+    authority = CellAuthority(effective_task_id, authority_tools)
     try:
         # Private dirs: the sandbox lives under a shared temp dir and carries the
         # RPC token (in req files) and tool results. Fail closed on setup
@@ -608,7 +635,7 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
                          "remote sandbox setup", timeout=10)
         rpc_token = secrets.token_urlsafe(32)
         _ship_file_to_remote(env, f"{sandbox_dir}/hermes_tools.py",
-                             generate_hermes_tools_module(list(sandbox_tools), transport="file"))
+                             generate_hermes_tools_module(sorted(authority.allowed_tools or ()), transport="file"))
         _ship_file_to_remote(env, f"{sandbox_dir}/script.py", code)
         # Wrapped so the thread inherits the turn's approval context + callbacks
         # (tools.thread_context) — else sandbox RPC tool calls lose approval routing.
@@ -616,14 +643,16 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
         rpc_thread = threading.Thread(
             target=propagate_context_to_thread(_rpc_poll_loop), daemon=True,
             args=(env, f"{sandbox_dir}/rpc", effective_task_id, tool_call_log, tool_call_counter,
-                  max_tool_calls, sandbox_tools, stop_event, rpc_token))
+                  max_tool_calls, sandbox_tools, stop_event, rpc_token),
+            kwargs={"cell_authority": authority})
         rpc_thread.start()
         # The token travels in a sourced env file, never in argv. No umask on
         # the launch command: the 700 dirs + explicit 0600 writes cover Hermes'
         # files, and user code keeps the remote's default file modes.
         launch_cmd = _ship_env_file_and_launch(
             env, sandbox_dir, "sandbox.env", "exec python3 script.py",
-            rpc_dir=f"{sandbox_dir}/rpc", rpc_token=rpc_token)
+            rpc_dir=f"{sandbox_dir}/rpc", rpc_token=rpc_token,
+            HERMES_RPC_CELL_TOKEN=authority.token)
         logger.info("Executing code on %s backend (task %s)...", env_type, effective_task_id[:8])
         script_result = env.execute(launch_cmd, timeout=timeout)
         stdout_text = script_result.get("output", "") or ""
@@ -633,6 +662,7 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
     except Exception as exc:
         return _remote_failure(exc, exec_start, tool_call_counter[0])
     finally:
+        authority.retire()
         stop_event.set()
         if rpc_thread is not None:
             rpc_thread.join(timeout=5)
@@ -884,6 +914,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set | None = None,
     must not appear or the model keeps trying it. ``mode`` (None → config) picks the cwd sentence."""
     if enabled_sandbox_tools is None:
         enabled_sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    enabled_sandbox_tools = set(enabled_sandbox_tools)
     if mode is None:
         mode = _get_execution_mode()
     tool_lines = "\n".join(doc for name, doc in _TOOL_DOC_LINES if name in enabled_sandbox_tools)
@@ -891,16 +922,19 @@ def build_execute_code_schema(enabled_sandbox_tools: set | None = None,
     import_examples = import_examples or sorted(enabled_sandbox_tools)[:2]
     import_str = ", ".join(import_examples) + ", ..." if import_examples else "..."
     if mode == "strict":
+        reaches = [name for name in ("terminal", "read_file") if name in enabled_sandbox_tools]
+        reach_note = (f" or use {', '.join(name + '()' for name in reaches)} to reach it"
+                      if reaches else "")
         cwd_note = (
             "Scripts run in their own temp dir, not the session's CWD — pass "
             "absolute paths for any file that lives outside the session's "
-            "working directory, or use terminal()/read_file() to reach it."
+            f"working directory{reach_note}."
         )
     else:
         cwd_note = (
             "Scripts run in the session's working directory. Interpreter: "
             "the project's activated venv/conda python when one is active "
-            "(VIRTUAL_ENV/CONDA_PREFIX — matches terminal()); otherwise "
+            "(VIRTUAL_ENV/CONDA_PREFIX — matches the session tool environment); otherwise "
             "Hermes's own python (the common case — stdlib plus Hermes's "
             "deps; check `import x` before relying on project packages)."
         )
@@ -924,7 +958,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set | None = None,
         f"{cwd_note}\n\n"
         "Helpers require imports: `from hermes_tools import json_parse, shell_quote, retry`. "
         "json_parse(text) — tolerant "
-        "json.loads for terminal() output; shell_quote(s) — shlex.quote for "
+        "json.loads; shell_quote(s) — shlex.quote for "
         "dynamic shell args; retry(fn, max_attempts=3, delay=2) — exponential backoff."
     )
     return {

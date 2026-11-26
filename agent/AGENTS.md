@@ -74,6 +74,8 @@ Adding one: register in that table (no `if name == ...` chain); `tools/todo_tool
   in `tools/delegate_tool.py` saves/restores it around subagent execution; code reading it may see
   a temporarily stale value during child runs.
 
+**Delegation launch policy (approved contract, draft only):** Per-task options are frozen before child prompt/tool initialization. Persona `replace` changes identity only; `append` retains it. Preserve Hermes/workspace/depth/output invariants and freeze persona/explicit skill contents across child compression. Explicit reasoning effort must survive all request/recovery/transport paths unchanged or the child is refused. Never rebuild or mutate the parent's prompt/tool schema when launching a child. This contract is not a claim of installed support or acceptance.
+
 ## Compression (`agent/compression_facade.py`, `conversation_compression.py`, `turn_context_compaction.py`)
 
 Manual `/compress` on every surface (CLI, gateway, TUI, ACP) runs through

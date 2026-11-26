@@ -61,7 +61,22 @@ keyed on the skill files' signatures, so a change written by another process is 
 itself converges at the next rebuild boundary (compaction). Legacy prompts retain their original
 host-before-context anchor, so prompts persisted before the reorder still validate.
 
-When `skip_context_files` is set (e.g., subagent delegation), SOUL.md is not loaded and the hardcoded `DEFAULT_AGENT_IDENTITY` is used instead.
+When `skip_context_files` is set (e.g., the existing subagent path without a persona override), SOUL.md is not loaded and the hardcoded `DEFAULT_AGENT_IDENTITY` is used instead. The approved per-task delegation contract can choose a profile persona and specialist instructions at child launch; availability depends on a release containing that implementation.
+
+### Delegated child persona and cache boundary (approved contract)
+
+For a delegated task with `system_prompt`, `system_prompt_mode` defaults to `replace`; `append` keeps
+the selected profile's identity and adds the supplied instructions. `replace` replaces the identity
+only. Hermes runtime and tool-operation guidance, project/workspace instruction files, task
+background, delegation-depth rules, output/completion contracts, and plugin operational sections
+remain under their normal owners and hooks. The goal remains the child's first user turn.
+
+Compose these parts structurally; do not regex-strip identity text from an already rendered prompt.
+Freeze the selected persona and explicit skill bodies for the child's conversation, including
+compression/rebuild. Launching a child never mutates the parent's cached system prompt, history, or
+tool-schema bytes. Explicit skills use the child profile's normal resolution and complete skill body
+with supporting-file metadata; preloading does not install a skill or execute inline-shell
+preprocessing. Missing or disallowed requested skills refuse that task.
 
 ### Concrete example: assembled system prompt
 
