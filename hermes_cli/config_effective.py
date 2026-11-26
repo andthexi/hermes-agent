@@ -26,7 +26,8 @@ from hermes_cli.config_read_errors import _warn_config_parse_failure
 # path -> raw user mapping from the last successful parse in this process; served (through the
 # normal pipeline) when the file is later found mid-edit as broken YAML.
 _LAST_GOOD_USER_RAW: dict[str, dict[str, Any]] = {}
-# path -> (*user_signature, *managed_signature, effective, env_snapshot); see utils.file_signature.
+# path -> (*user_signature, *managed_signature, effective, env_snapshot, root_is_mapping);
+# see utils.file_signature.
 _EFFECTIVE_CACHE: dict[str, tuple[Any, ...]] = {}
 
 
@@ -52,10 +53,13 @@ def _recover_user_raw(config_path: Path, path_key: str, exc: Exception) -> dict[
 def load_user_config_effective(config_path: Optional[Path] = None, *, fail_closed: bool = False) -> dict[str, Any]:
     """Raw user settings plus enabled plugin defaults and managed policy, without built-in defaults.
 
-    Plugin values are composed beneath explicitly present user values, then environment-expanded and
-    overlaid by managed policy. Raw recovery and write-back remain file-only. A frozen worker uses its
-    owner-provided snapshot and performs no manifest discovery.
-    """
+    Plugin values are composed beneath explicitly present user values and managed policy.
+    Broken YAML: ``fail_closed=True`` raises the parse error, including a non-mapping YAML root
+    (for callers that keep their own last-good state); otherwise the last successfully parsed
+    user file — in-process first, then
+    the newest ``backups/config/*.good.*`` copy — is served through the same pipeline, so a
+    mid-edit torn write never silently drops user overrides (same contract as ``load_config``).
+    Cached on the user + managed file signatures and the values of every referenced env var."""
     from agent.safe_worker_policy import worker_config_snapshot
 
     snapshot = worker_config_snapshot()
@@ -68,6 +72,7 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
         user_sig, source_cache_sig = _config._load_config_cache_sig(config_path)
         raw: dict[str, Any] = {}
         recovered = False
+        root_is_mapping: Optional[bool] = True if user_sig is None else None
         raw_hit = _config._raw_config_cache_hit(path_key, user_sig) if user_sig is not None else None
         if raw_hit is not None:
             raw = copy.deepcopy(raw_hit)
@@ -80,6 +85,9 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
                     raise
                 raw, recovered = _recover_user_raw(config_path, path_key, exc), True
             else:
+                root_is_mapping = loaded is None or isinstance(loaded, dict)
+                if fail_closed and not root_is_mapping:
+                    raise TypeError("config.yaml root is not a mapping")
                 raw = loaded if isinstance(loaded, dict) else {}
                 _config._raw_config_cache_store(path_key, user_sig, copy.deepcopy(raw))
                 _LAST_GOOD_USER_RAW[path_key] = copy.deepcopy(raw)
@@ -87,6 +95,14 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
                     from hermes_cli.config_backups import backup_config
                     backup_config(config_path, "good")
 
+        if fail_closed and root_is_mapping is None:
+            # Raw-config cache hits contain only normalized dicts, not the root shape.
+            loaded = read_config_doc(config_path)
+            if loaded is not None and not isinstance(loaded, dict):
+                raise TypeError("config.yaml root is not a mapping")
+            root_is_mapping = True
+
+        env_snapshot = _config._env_ref_snapshot(raw)
         managed = managed_scope.load_managed_config()
         normalized = _config._normalize_root_model_keys(copy.deepcopy(raw))
         from hermes_cli.config_plugin_defaults import compose_user_layer
@@ -106,7 +122,9 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
             _config._env_ref_snapshot(managed, env_snapshot)
         effective = _effective(plugin_user)
         if cache_sig is not None and not recovered:
-            _EFFECTIVE_CACHE[path_key] = (*cache_sig, copy.deepcopy(effective), env_snapshot)
+            _EFFECTIVE_CACHE[path_key] = (
+                *cache_sig, copy.deepcopy(effective), env_snapshot, root_is_mapping,
+            )
         else:
             _EFFECTIVE_CACHE.pop(path_key, None)
         return effective

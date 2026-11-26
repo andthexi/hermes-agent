@@ -1,6 +1,7 @@
 """Real child route pinning under an actual loopback provider failure."""
 
 import json
+from hermes_constants import get_hermes_home
 import os
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,7 +11,7 @@ import hermes_yaml as yaml
 
 from run_agent import AIAgent
 from tests.fakes.fake_llm_provider import Error, FakeLLMServer, Text, write_hermes_home
-from tests.fakes.providers.gemini_native import HERMES_ENV, MODEL_ID, GeminiFake, Text as GeminiText
+from tests.fakes.providers.gemini_native import HERMES_CONFIG, HERMES_ENV, MODEL_ID, GeminiFake, Text as GeminiText
 from tools.delegate_tool import delegate_task
 
 
@@ -19,11 +20,11 @@ def test_provider_only_uses_saved_profile_default_not_parent_switched_model(tmp_
     monkeypatch.delenv("HERMES_IGNORE_USER_CONFIG", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     with GeminiFake(tmp_path / "gemini-fake", [GeminiText("saved Gemini default completed")]) as server:
-        home = tmp_path / ".hermes"
+        home = tmp_path / "hermes-test-home"
         monkeypatch.setenv("HERMES_HOME", str(home))
         home.mkdir(parents=True)
         (home / "config.yaml").write_text(yaml.safe_dump({
-            "model": {"provider": "gemini", "default": MODEL_ID},
+            "model": {"provider": "gemini", "default": MODEL_ID}, **HERMES_CONFIG,
             "agent": {"api_max_retries": 1},
             "delegation": {"fallback_providers": []},
             "telemetry": {"shared_metrics": {"enabled": False, "send": False}},
@@ -250,7 +251,7 @@ def test_profile_route_override_stays_pinned_on_failure(
         FakeLLMServer(fail_explicit_but_finish_profile_primary) as primary,
         FakeLLMServer([Text("declared fallback completed")], api_key="fallback-child-secret") as fallback,
     ):
-        home = tmp_path / ".hermes"
+        home = tmp_path / "hermes-test-home"
         monkeypatch.setenv("HERMES_HOME", str(home))
         write_hermes_home(home, primary.base_url, api_key="parent-secret")
         profile_home = home / "profiles" / "worker"
@@ -323,7 +324,7 @@ def test_legacy_fallback_activates_unpinned_and_explicit_route_pin_suppresses_sa
         FakeLLMServer(reject_primary) as primary,
         FakeLLMServer([Text("legacy fallback completed")], api_key="fallback-child-secret") as fallback,
     ):
-        home = tmp_path / ".hermes"
+        home = tmp_path / "hermes-test-home"
         monkeypatch.setenv("HERMES_HOME", str(home))
         extra_config = (
             "delegation:\n"
@@ -430,7 +431,7 @@ def test_authoritative_profile_catalog_rejects_before_child_inference(tmp_path, 
     worker = Thread(target=server.serve_forever, daemon=True)
     worker.start()
     try:
-        home = tmp_path / ".hermes"
+        home = tmp_path / "hermes-test-home"
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.delenv("HERMES_IGNORE_USER_CONFIG", raising=False)
@@ -522,7 +523,7 @@ def _write_profile_auth_provider(profile_dir, base_url):
 def test_missing_selected_profile_credential_refuses_before_inference_and_sibling_runs(tmp_path, monkeypatch):
     """A selected profile's required key cannot fall through to the parent's environment key."""
     with FakeLLMServer([Text("valid sibling completed")], api_key="valid-sibling-key") as server:
-        home = tmp_path / ".hermes"
+        home = tmp_path / "hermes-test-home"
         write_hermes_home(home, server.base_url, api_key="parent-only-key")
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("HERMES_HOME", str(home))
@@ -585,9 +586,8 @@ def test_registered_backend_authorization_refusal_survives_route_overrides_and_s
     """A real registered backend refusal comes before explicit model/provider overrides."""
     from hermes_cli import plugins as plugins_mod
     from hermes_cli.plugins import PluginManager
-    from pathlib import Path
 
-    home = tmp_path / ".hermes"
+    home = tmp_path / "hermes-test-home"
     backend_dir = home / "plugins" / "auth-guard"
     backend_dir.mkdir(parents=True)
     (backend_dir / "plugin.yaml").write_text("name: auth-guard\nversion: 1.0\n", encoding="utf-8")
@@ -696,7 +696,7 @@ def test_inconclusive_profile_catalog_runs_exact_pair_and_reports_warning(tmp_pa
     worker = Thread(target=server.serve_forever, daemon=True)
     worker.start()
     try:
-        home = tmp_path / ".hermes"
+        home = tmp_path / "hermes-test-home"
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.delenv("HERMES_IGNORE_USER_CONFIG", raising=False)
@@ -886,7 +886,7 @@ def test_strict_child_reasoning_effort_is_not_dropped_after_real_provider_400(tm
         return Text("valid control completed")
 
     with FakeLLMServer(reject_strict_effort, api_key="fixture-parent-key") as server:
-        home = tmp_path / ".hermes"
+        home = tmp_path / "hermes-test-home"
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.delenv("HERMES_IGNORE_USER_CONFIG", raising=False)
@@ -957,7 +957,7 @@ def test_disabled_unavailable_and_static_conflict_routes_refuse_before_inference
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     with FakeLLMServer([Text("valid sibling completed")], api_key="valid-sibling-key") as server:
-        home = tmp_path / ".hermes"
+        home = tmp_path / "hermes-test-home"
         write_hermes_home(home, server.base_url, api_key="parent-secret")
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("HERMES_HOME", str(home))
@@ -1060,7 +1060,7 @@ def test_registered_mode_hook_failure_preserves_exact_effort_and_valid_sibling(t
     previous_source = providers._SOURCES.get("custom")
     profile = RaisingModeProfile(name="custom", api_mode="chat_completions")
     providers.register_provider(profile)
-    home = tmp_path / ".hermes"
+    home = tmp_path / "hermes-test-home"
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(home))
 
@@ -1162,7 +1162,7 @@ def test_registered_effort_hook_failure_preserves_exact_wire_and_sibling(tmp_pat
     previous_source = providers._SOURCES.get("custom")
     profile = RaisingEffortProfile(name="custom", api_mode="chat_completions")
     providers.register_provider(profile)
-    home = tmp_path / ".hermes"
+    home = tmp_path / "hermes-test-home"
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(home))
     try:
@@ -1230,7 +1230,7 @@ def test_catalog_validator_exception_attempts_exact_route_without_leaking(tmp_pa
         pass
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    home = tmp_path / ".hermes"
+    home = tmp_path / "hermes-test-home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     from hermes_constants import named_profile_has_identity
     from tests.fakes.fake_llm_provider import write_hermes_home as setup_home
@@ -1336,8 +1336,7 @@ def test_combined_joined_overrides_pin_wire_prompt_grant_and_transcript_owner(tm
     from hermes_state import SessionDB
     with FakeLLMServer([Text('{"city":"Oslo"}'), Text('{"city":"Oslo","zip":"0170"}')],
                        api_key="combined-profile-key") as server:
-        home = tmp_path / ".hermes"
-        parent_home = home
+        home = tmp_path / "hermes-test-home"
         profile = home / "profiles" / "researcher"
         _write_combined_profile(home, server.base_url, "parent-config-secret")
         profile.mkdir(parents=True)
@@ -1353,9 +1352,7 @@ def test_combined_joined_overrides_pin_wire_prompt_grant_and_transcript_owner(tm
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.delenv("HERMES_IGNORE_USER_CONFIG", raising=False)
 
-        import hermes_state
-        monkeypatch.setattr(hermes_state, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", ())
-        db = SessionDB(db_path=parent_home / "state.db")
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
         parent = _combined_parent(home, server.base_url, db, session_id="combined-joined-parent",
                                   parent_key="parent-config-secret")
         from tools.delegate_tool import oneshot_delegate_function
@@ -1444,7 +1441,7 @@ def test_combined_mixed_refusals_keep_valid_sibling_and_redact_diagnostics(tmp_p
     try:
         with FakeLLMServer([Text("valid sibling completed")],
                            api_key=("mixed-parent-key", "valid-profile-key")) as server:
-            home = tmp_path / ".hermes"
+            home = tmp_path / "hermes-test-home"
             _write_combined_profile(home, server.base_url, "mixed-parent-key")
             valid_profile = home / "profiles" / "valid"
             valid_profile.mkdir(parents=True)
@@ -1459,9 +1456,7 @@ def test_combined_mixed_refusals_keep_valid_sibling_and_redact_diagnostics(tmp_p
             monkeypatch.setenv("HERMES_HOME", str(home))
             monkeypatch.delenv("HERMES_IGNORE_USER_CONFIG", raising=False)
 
-            import hermes_state
-            monkeypatch.setattr(hermes_state, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", ())
-            db = SessionDB(db_path=home / "state.db")
+            db = SessionDB(db_path=get_hermes_home() / "state.db")
             parent = AIAgent(
                 provider="custom", model="fixture-model", base_url=server.base_url,
                 api_key="mixed-parent-key", api_mode="chat_completions",
@@ -1524,8 +1519,6 @@ def _prepare_combined_background(home, endpoint, db, monkeypatch, *, session_ids
     monkeypatch.setenv("HOME", str(host_home))
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.delenv("HERMES_IGNORE_USER_CONFIG", raising=False)
-    import hermes_state
-    monkeypatch.setattr(hermes_state, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", ())
     parents = []
     from tools.delegate_tool import DELEGATE_TASK_SCHEMA, oneshot_delegate_function
     from tools.delegate_tool import delegate_task as public_delegate
@@ -1568,8 +1561,8 @@ def test_combined_background_target_stop_is_local_and_preserves_sibling(tmp_path
     with FakeLLMServer(respond, api_key=("parent-loopback-secret", "no-key-required")) as server:
         registry.register(name="read_file", toolset="file", schema=previous_read_file.schema,
                           handler=blocked_read, override=True)
-        home = tmp_path / ".hermes"
-        db = SessionDB(db_path=home / "state.db")
+        home = tmp_path / "hermes-test-home"
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
         parents, public_delegate = _prepare_combined_background(
             home, server.base_url, db, monkeypatch, session_ids=("target-stop-parent",),
         )
@@ -1632,8 +1625,8 @@ def test_combined_background_session_cancel_stops_owned_batch_not_foreign_owner(
         return Text(f"{name} finished")
 
     with FakeLLMServer(respond, api_key=("parent-loopback-secret", "no-key-required")) as server:
-        home = tmp_path / ".hermes"
-        db = SessionDB(db_path=home / "state.db")
+        home = tmp_path / "hermes-test-home"
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
         parents, public_delegate = _prepare_combined_background(
             home, server.base_url, db, monkeypatch, session_ids=("owned-session-parent", "foreign-session-parent"),
         )
@@ -1691,8 +1684,8 @@ def test_combined_background_steer_and_completion_keep_route_metadata_and_owners
     with FakeLLMServer([ToolCall("read_file", {"path": "fixture-path"}),
                         Text('{"answer":"steer incorporated"}')],
                        api_key=("combined-profile-key", "parent-loopback-secret", "no-key-required")) as server:
-        home = tmp_path / ".hermes"
-        db = SessionDB(db_path=home / "state.db")
+        home = tmp_path / "hermes-test-home"
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
         parents, public_delegate = _prepare_combined_background(
             home, server.base_url, db, monkeypatch, session_ids=("combined-background-parent",),
         )
@@ -1813,7 +1806,7 @@ def test_external_process_refuses_unenforceable_task_controls_before_spawn(tmp_p
     from tests.fakes.providers import fake_acp_agent as acp
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    home = tmp_path / ".hermes"
+    home = tmp_path / "hermes-test-home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.delenv("HERMES_IGNORE_USER_CONFIG", raising=False)
     profile_home = home / "profiles" / "acp-worker"
@@ -1912,7 +1905,7 @@ def test_ordinary_external_process_task_still_runs_over_real_acp(tmp_path, monke
     from tests.fakes.providers import fake_acp_agent as acp
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    home = tmp_path / ".hermes"
+    home = tmp_path / "hermes-test-home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.delenv("HERMES_IGNORE_USER_CONFIG", raising=False)
     fake = acp.AcpFake(tmp_path / "acp-legacy", [[acp.message("ordinary ACP route completed")]])
@@ -1960,7 +1953,7 @@ def test_external_process_cannot_bypass_inherited_exact_tool_ceiling(tmp_path, m
     from tests.fakes.providers import fake_acp_agent as acp
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    home = tmp_path / ".hermes"
+    home = tmp_path / "hermes-test-home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.delenv("HERMES_IGNORE_USER_CONFIG", raising=False)
     fake = acp.AcpFake(tmp_path / "acp-inherited-ceiling", [[acp.message("inherited ceiling escaped")]])

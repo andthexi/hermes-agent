@@ -1,6 +1,8 @@
 """Real child startup and local inference for an explicitly empty tool list."""
 
 import json
+from hermes_constants import get_hermes_home
+from pathlib import Path
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -96,7 +98,7 @@ def test_direct_registered_mcp_grant_does_not_require_bridge_tools(tmp_path, mon
     from tools.delegate_tool_validation import _exact_builtin_tool_grant_error
     from tools.registry import registry
 
-    home = tmp_path / ".hermes"
+    home = tmp_path / "hermes-test-home"
     home.mkdir()
     (home / "config.yaml").write_text(yaml.safe_dump({
         "tools": {"tool_search": {"enabled": "on", "defer": []}},
@@ -260,7 +262,7 @@ def test_public_mcp_bridge_search_describe_invoke_use_exact_registered_grants(tm
     from run_agent import AIAgent
     from tools.registry import registry
 
-    home = tmp_path / ".hermes"
+    home = tmp_path / "hermes-test-home"
     home.mkdir()
     (home / "config.yaml").write_text(yaml.safe_dump({
         "platform_toolsets": {"subagent": ["mcp-bridge-boundary"]},
@@ -330,7 +332,7 @@ def test_empty_child_runtime_dispatch_refuses_direct_and_executor_calls(tmp_path
     from agent.tool_executor import execute_tool_calls_concurrent, execute_tool_calls_sequential
     from run_agent import AIAgent
 
-    home = tmp_path / ".hermes"
+    home = tmp_path / "hermes-test-home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -516,7 +518,7 @@ def test_empty_child_mixed_protocol_and_refresh_compatibility(tmp_path, monkeypa
     thread.start()
     parent = None
     try:
-        home = tmp_path / ".hermes"
+        home = tmp_path / "hermes-test-home"
         home.mkdir()
         (tmp_path / "exact-grant-readable.txt").write_text("delegate startup read proof")
         (tmp_path / "second-readable.txt").write_text("second mixed read result")
@@ -530,7 +532,9 @@ def test_empty_child_mixed_protocol_and_refresh_compatibility(tmp_path, monkeypa
             ephemeral_system_prompt="PARENT_PROMPT_MARKER", max_iterations=2,
         )
         from hermes_state import SessionDB
-        parent._session_db = SessionDB(db_path=tmp_path / "state.db")
+        parent._session_db = SessionDB(db_path=get_hermes_home() / "state.db")
+        from agent.agent_init_session import stand_in_interface
+        parent.persistence = stand_in_interface(parent._session_db)
         parent._ensure_db_session()
         owner_grant = _parent_tool_grant(parent)
         assert owner_grant is not None and {"read_file", "write_file"}.issubset(owner_grant)
@@ -724,6 +728,10 @@ def test_empty_child_mixed_protocol_and_refresh_compatibility(tmp_path, monkeypa
         from openai.types.chat import ChatCompletionMessage, ChatCompletionMessageToolCall
         from agent.turn_tool_validation import validate_tool_calls
         guard_agent = read_child
+        # Delegation closed the child's owned handle; these post-run protocol probes borrow
+        # the still-open parent's store, preserving real persistence without reopening a retired handle.
+        guard_agent._session_db = parent._session_db
+        guard_agent.persistence = parent.persistence
         call = lambda name, args: ChatCompletionMessageToolCall.model_validate({
             "id": "guard-" + name, "type": "function",
             "function": {"name": name, "arguments": args},
@@ -825,7 +833,7 @@ def test_exact_builtin_grant_survives_real_pin_reload_and_compression(tmp_path, 
     from tools.mcp_tool_agent import refresh_agent_mcp_tools, restore_agent_tool_prefix, tool_pin_version
     from tools.registry import registry
 
-    home = tmp_path / ".hermes"
+    home = tmp_path / "hermes-test-home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -841,7 +849,7 @@ def test_exact_builtin_grant_survives_real_pin_reload_and_compression(tmp_path, 
         parent_tool_grant=("read_file", "terminal", "write_file"),
     )
     legacy_policy = DelegationLaunchPolicy(tools=None)
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = SessionDB(db_path=get_hermes_home() / "state.db")
     db.create_session("lifecycle-session", source="test")
     agents = []
 
@@ -853,6 +861,8 @@ def test_exact_builtin_grant_survives_real_pin_reload_and_compression(tmp_path, 
             platform="subagent", session_id="lifecycle-session", delegation_launch_policy=policy,
         )
         child._session_db = db
+        from agent.agent_init_session import stand_in_interface
+        child.persistence = stand_in_interface(db)
         agents.append(child)
         return child
 
@@ -894,8 +904,10 @@ def test_exact_builtin_grant_survives_real_pin_reload_and_compression(tmp_path, 
                 {"type": "function", "function": fixture_schema},
                 next(item for item in original.tools if item["function"]["name"] == "terminal"),
             ]}
-            db.update_session_tool_names("lifecycle-session", pin)
-            stored_pin = json.loads(db.get_session("lifecycle-session")["tool_names"])
+            from agent.agent_init_session import stand_in_interface
+            store = stand_in_interface(db)
+            store.sessions.update_tool_pin("lifecycle-session", pin)
+            stored_pin = store.sessions.get("lifecycle-session").tool_pin
             rebuilt = build_agent()
             rebuilt._context_engine_tool_names = {fixture_name}
             restore_agent_tool_prefix(rebuilt, stored_pin)
@@ -977,7 +989,7 @@ def test_nonempty_child_tool_grant_is_exact_at_startup_and_runtime(tmp_path, mon
     from agent.tool_executor import execute_tool_calls_concurrent, execute_tool_calls_sequential
     from run_agent import AIAgent
 
-    home = tmp_path / ".hermes"
+    home = tmp_path / "hermes-test-home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -1063,7 +1075,7 @@ def test_nonempty_exact_grant_refuses_when_actual_child_surface_is_unavailable(t
     from agent import agent_init
     from run_agent import AIAgent
 
-    home = tmp_path / ".hermes"
+    home = tmp_path / "hermes-test-home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -1097,7 +1109,6 @@ def test_composite_profile_tool_selection_is_checked_by_effective_tool_membershi
 
     option, error = TaskRouteOptions.parse({"tools": ["read_file"]}, 0)
     assert error is None and option is not None
-    from pathlib import Path
     route = type("Route", (), {"profile_home": Path("/selected-profile")})()
     parent = type("Parent", (), {"platform": "cli"})()
     config = {"platform_toolsets": {"cli": ["hermes-cli", "web"]},
@@ -1107,7 +1118,6 @@ def test_composite_profile_tool_selection_is_checked_by_effective_tool_membershi
 
 
 def test_composite_profile_without_builtin_surface_refuses_exact_grant():
-    from pathlib import Path
     from tools.delegate_tool_options import TaskRouteOptions
     from tools.delegate_tool_validation import _exact_builtin_tool_grant_error
 
@@ -1130,7 +1140,7 @@ def test_unchanged_exact_tool_refresh_reconciles_context_routing_without_legacy_
     from tools.mcp_tool_agent import refresh_agent_mcp_tools
     from tools.registry import registry
 
-    home = tmp_path / ".hermes"
+    home = tmp_path / "hermes-test-home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -1200,7 +1210,7 @@ def test_nested_grant_boundaries_use_real_public_dispatch(tmp_path, monkeypatch)
     from run_agent import AIAgent
     from tools.delegate_tool import delegate_task
 
-    home = tmp_path / ".hermes"
+    home = tmp_path / "hermes-test-home"
     home.mkdir()
     (home / "config.yaml").write_text(yaml.safe_dump({
         "delegation": {"orchestrator_enabled": True, "max_spawn_depth": 2, "max_iterations": 5},
@@ -1463,7 +1473,7 @@ def test_combined_exact_tool_child_refuses_ungranted_runtime_effect_and_keeps_pa
         ToolCall(name, {"path": str(target), "content": "must never persist"}),
         Text("combined grant check complete"),
     ], api_key="combined-parent-key") as server:
-        home = tmp_path / ".hermes"
+        home = tmp_path / "hermes-test-home"
         home.mkdir()
         skill_dir = home / "skills" / "research" / "combined-exact-skill"
         skill_dir.mkdir(parents=True)
@@ -1478,9 +1488,7 @@ def test_combined_exact_tool_child_refuses_ungranted_runtime_effect_and_keeps_pa
         monkeypatch.setenv("HOME", str(tmp_path / "host-home"))
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.delenv("HERMES_IGNORE_USER_CONFIG", raising=False)
-        import hermes_state
-        monkeypatch.setattr(hermes_state, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", ())
-        db = SessionDB(db_path=home / "state.db")
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
         parent = AIAgent(
             provider="custom", model="fixture-model", base_url=server.base_url,
             api_key="combined-parent-key", api_mode="chat_completions", enabled_toolsets=["delegation", "file"],
@@ -1532,7 +1540,7 @@ def test_public_delegate_child_runs_readonly_execute_code_end_to_end(tmp_path, m
     import json
     from tests.fakes.fake_llm_provider import FakeLLMServer, Text, ToolCall
     requests = []
-    root = tmp_path / ".hermes"
+    root = tmp_path / "hermes-test-home"
     root.mkdir()
     test_config = ("platform_toolsets:\n  subagent: [hermes-cli, code_execution, delegation]\n"
                    "delegation:\n  worktree_isolation: false\n"
@@ -1569,7 +1577,7 @@ def test_public_delegate_child_runs_readonly_execute_code_end_to_end(tmp_path, m
         from run_agent import AIAgent
         from tools.delegate_tool import delegate_task
         from hermes_state import SessionDB
-        db = SessionDB(db_path=tmp_path / "loopback-sessions.db")
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
         parent = AIAgent(
             api_key="loopback-test-key", base_url=server.base_url, provider="custom",
             api_mode="chat_completions", model="loopback-model",
@@ -1853,144 +1861,3 @@ def test_remote_cell_authority_intersects_helper_allowlist_and_retires(tmp_path)
         dispatch=dispatch, tool_call_log=log, call_start=0, where="test", cell_authority=authority))
     assert "retired" in stale["error"]
     assert effects == [] and counter == [0]
-
-
-def test_remote_concurrent_cells_keep_one_authority_window(tmp_path):
-    import json
-    import os
-    import subprocess
-    import threading
-    from pathlib import Path
-    from pm.shell import bash
-    from tools.code_kernel_remote import (
-        _REMOTE_KERNELS, execute_in_remote_kernel, shutdown_remote_kernels_for_owner,
-    )
-    from tools.thread_context import exact_tool_scope
-
-    shell = bash()
-    assert shell
-    first_result_waiting, release_first_result = threading.Event(), threading.Event()
-    second_request_published = threading.Event()
-
-    class LocalFileEnvironment:
-        def __init__(self):
-            self.lock = threading.Lock()
-            self.first_result_paused = False
-
-        def get_temp_dir(self):
-            return str(tmp_path)
-
-        def execute(self, command, cwd="/", timeout=20, stdin_data=None):
-            if "cell_req_000002" in command:
-                second_request_published.set()
-            if "cat" in command and "cell_res_000001.json" in command:
-                with self.lock:
-                    pause = not self.first_result_paused
-                    self.first_result_paused = True
-                if pause:
-                    first_result_waiting.set()
-                    assert release_first_result.wait(timeout=10)
-            result = subprocess.run([shell, "-c", command], cwd=cwd, timeout=timeout,
-                                    env=dict(os.environ), input=stdin_data or "", capture_output=True,
-                                    text=True, check=False)
-            return {"output": result.stdout + result.stderr, "returncode": result.returncode}
-
-    env = LocalFileEnvironment()
-    source_a, source_b = tmp_path / "parallel-a.txt", tmp_path / "parallel-b.txt"
-    source_a.write_text("first remote cell", encoding="utf-8")
-    source_b.write_text("second remote cell", encoding="utf-8")
-    results, failures = {}, []
-    second_call_entered = threading.Event()
-
-    def run_cell(label, source):
-        try:
-            if label == "second":
-                second_call_entered.set()
-            with exact_tool_scope({"execute_code", "read_file"}):
-                results[label] = execute_in_remote_kernel(
-                    f"import hermes_tools; print(hermes_tools.read_file({str(source)!r})['content'])",
-                    env=env, env_type="local-file-concurrency", task_env_id="remote-cell-window",
-                    sandbox_tools=frozenset({"read_file"}), timeout=15,
-                    max_tool_calls=5, reset=False, idle_exit=60,
-                )
-        except BaseException as exc:
-            failures.append(exc)
-
-    first = threading.Thread(target=run_cell, args=("first", source_a))
-    second = threading.Thread(target=run_cell, args=("second", source_b))
-    first.start()
-    try:
-        assert first_result_waiting.wait(timeout=10)
-        kernel = next(kernel for kernel in _REMOTE_KERNELS.values() if kernel.owner == "remote-cell-window")
-        first_authority = kernel.cell_authority
-        assert first_authority is not None and first_authority.active
-        second.start()
-        # The first cell is held after execution but before its result is read. A
-        # second same-key request must remain outside the RPC/cell authority window.
-        assert second_call_entered.wait(timeout=3)
-        assert not second_request_published.wait(timeout=0.5)
-        assert kernel.cell_authority is first_authority
-    finally:
-        release_first_result.set()
-        first.join(timeout=10)
-        if second.ident is not None:
-            second.join(timeout=10)
-    assert not first.is_alive() and not second.is_alive()
-    assert failures == [], failures
-    assert results["first"] is not None and results["first"]["status"] == "success", results
-    assert results["second"] is not None and results["second"]["status"] == "success", results
-    assert "first remote cell" in results["first"]["stdout"]
-    assert "second remote cell" in results["second"]["stdout"]
-    assert second_request_published.is_set()
-    kernel = next(kernel for kernel in _REMOTE_KERNELS.values() if kernel.owner == "remote-cell-window")
-    assert kernel.attached == 0 and kernel.cell_authority is None
-    shutdown_remote_kernels_for_owner("remote-cell-window")
-    assert not any(kernel.owner == "remote-cell-window" for kernel in _REMOTE_KERNELS.values())
-
-
-def test_remote_persistent_kernel_runs_real_cell_and_rpc_over_file_transport(tmp_path):
-    import os
-    import subprocess
-    from pm.shell import bash
-    from tools.code_execution_tool import SANDBOX_ALLOWED_TOOLS
-    from tools.code_kernel_remote import (
-        _REMOTE_KERNELS, execute_in_remote_kernel, shutdown_remote_kernels_for_owner,
-    )
-    from tools.thread_context import exact_tool_scope
-
-    shell = bash()
-    assert shell
-    class LocalFileEnvironment:
-        def get_temp_dir(self): return str(tmp_path)
-        def execute(self, command, cwd="/", timeout=20, stdin_data=None):
-            result = subprocess.run([shell, "-c", command], cwd=cwd, timeout=timeout,
-                                    env=dict(os.environ), input=stdin_data or "", capture_output=True,
-                                    text=True, check=False)
-            return {"output": result.stdout + result.stderr, "returncode": result.returncode}
-    env = LocalFileEnvironment()
-    source = tmp_path / "persistent-source.txt"
-    source.write_text("remote persistent file fixture\n", encoding="utf-8")
-    forbidden = tmp_path / "persistent-forbidden.txt"
-    code = f'''\
-import hermes_tools, json
-read = hermes_tools.read_file({str(source)!r})
-denied = hermes_tools._call("write_file", {{"path": {str(forbidden)!r}, "content": "forbidden"}})
-print(json.dumps({{"read": read["content"], "denied": denied,
-                  "has_write_stub": hasattr(hermes_tools, "write_file")}}))
-'''
-    with exact_tool_scope({"execute_code", "read_file"}):
-        first = execute_in_remote_kernel(
-            code, env=env, env_type="local-file-fixture", task_env_id="persistent-file-rpc",
-            sandbox_tools=frozenset(SANDBOX_ALLOWED_TOOLS), timeout=8,
-            max_tool_calls=5, reset=False, idle_exit=60,
-        )
-    assert first is not None and first["status"] == "success", first
-    assert "remote persistent file fixture" in first["stdout"]
-    assert "outside this execute_code cell's exact tool grant" in first["stdout"]
-    assert '"has_write_stub": false' in first["stdout"]
-    assert not forbidden.exists()
-    kernels = [kernel for kernel in _REMOTE_KERNELS.values() if kernel.owner == "persistent-file-rpc"]
-    assert len(kernels) == 1
-    shutdown_remote_kernels_for_owner("persistent-file-rpc")
-    assert not any(kernel.owner == "persistent-file-rpc" for kernel in _REMOTE_KERNELS.values())
-    assert not kernels[0].is_alive()

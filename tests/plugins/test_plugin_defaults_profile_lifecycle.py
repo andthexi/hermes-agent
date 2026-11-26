@@ -85,7 +85,8 @@ def test_multiplex_startup_skips_only_profile_with_invalid_defaults(tmp_path, mo
     monkeypatch.setattr(profiles, "profiles_to_serve", lambda *_a, **_kw: [("default", tmp_path / "launch-home")])
     monkeypatch.setattr(profiles, "profile_is_parked", lambda _home: False)
     runner = object.__new__(GatewayRunner)
-    runner.config = {}
+    from gateway.config import GatewayConfig
+    runner.config = GatewayConfig()
     runner.adapters = {}
     runner._failed_platforms = {}
     runner._multiplex_on = lambda: True
@@ -94,12 +95,17 @@ def test_multiplex_startup_skips_only_profile_with_invalid_defaults(tmp_path, mo
     runner._record_served_profiles = lambda *_args: None
     runner._restore_secondary_completion_ledgers = lambda *_args: None
 
-    async def start_profile(name, profile_home, _claimed):
-        if name == "broken":
-            await runner._load_secondary_profile_config(name, profile_home)
-        return 1
+    prepared = []
 
-    runner._start_one_profile_adapters = start_profile
+    async def prepare_profile(name, profile_home, _claimed, _batch):
+        await runner._load_secondary_profile_config(name, profile_home)
+        prepared.append(name)
+
+    async def connect_profiles(_batch, _claimed, _failed):
+        return len(prepared)
+
+    runner._prepare_one_profile_adapters = prepare_profile
+    runner._connect_staged_profile_adapters = connect_profiles
     connected = asyncio.run(runner._start_secondary_profile_adapters())
 
     assert connected == 1

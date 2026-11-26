@@ -128,6 +128,9 @@ def _config_schemas() -> tuple[Mapping[str, Any], Mapping[str, Any]]:
 def _schema_value(parts: tuple[str, ...]) -> Any:
     """Return a known schema node from the config or classic-CLI runtime schema."""
     schemas = _config_schemas()
+    if parts == ("agent", "max_turns"):
+        # The unlimited default is null; finite configured turn caps remain integers.
+        return (int,)
     if parts[0] == "model":
         schemas = (schemas[1], schemas[0])  # DEFAULT_CONFIG's model root is a legacy string shorthand.
     saw_untyped_path = False

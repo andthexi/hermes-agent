@@ -1,6 +1,8 @@
 """Behavior contract for first-persona child prompt composition and wire delivery."""
 
 import json
+from hermes_constants import get_hermes_home
+from pathlib import Path
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
@@ -131,7 +133,7 @@ def test_codex_app_server_refuses_exact_grant_and_inherited_ceiling_before_start
 
 
 def test_identity_composition_replace_append_and_default_keep_guidance(tmp_path, monkeypatch):
-    root = tmp_path / ".hermes"
+    root = tmp_path / "hermes-test-home"
     root.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(root))
     (root / "SOUL.md").write_text("selected profile persona", encoding="utf-8")
@@ -223,12 +225,10 @@ def test_actual_delegated_child_sends_exact_persona_and_workspace_on_loopback(tm
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setenv("TERMINAL_CWD", str(workspace))
-        monkeypatch.setattr("tools.delegate_tool._load_config", dict)
+        monkeypatch.setattr("tools.delegate_tool_config._load_config", dict)
         import tools.delegate_tool_config as delegation_config
         monkeypatch.setattr(delegation_config, "_load_config", dict)
-        import hermes_state
-        monkeypatch.setattr(hermes_state, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", ())
-        db = SessionDB(db_path=home / "state.db")
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
         endpoint = f"http://127.0.0.1:{server.server_port}/v1"
         parent = AIAgent(api_key="parent-secret", base_url=endpoint, provider="custom",
                          api_mode="chat_completions", model="persona-model", platform="cli",
@@ -324,12 +324,13 @@ def test_actual_delegated_child_sends_exact_persona_and_workspace_on_loopback(tm
             "completed", "error", "completed", "completed", "completed"]
         assert route_output["results"][1]["api_calls"] == 0
         assert "absent-skill" in route_output["results"][1]["error"]
+        from tools.delegate_tool_progress import child_task_message
         route_requests = {
-            request["messages"][1]["content"]: request
-            for request in requests
+            task["goal"]: request
+            for task in route_tasks for request in requests
             if len(request.get("messages", [])) > 1
             and request["messages"][1].get("role") == "user"
-            and request["messages"][1].get("content") in {task["goal"] for task in route_tasks}
+            and request["messages"][1].get("content") == child_task_message(task["goal"], task.get("context"))
         }
         expected_inference_goals = {"append user goal", "replace user goal", "default user goal",
                                     "profile skill preload user goal"}
@@ -350,7 +351,8 @@ def test_actual_delegated_child_sends_exact_persona_and_workspace_on_loopback(tm
             assert "Important workspace rule" in wire_system
             assert workspace.as_posix() in wire_system
             assert "workspace-marker-9037" in wire_system
-            assert task["context"] in wire_system
+            assert task["context"] not in wire_system
+            assert task["context"] in route_requests[task["goal"]]["messages"][1]["content"]
             assert "first user goal" not in wire_system and task["goal"] not in wire_system
             expected_personas = {
                 "append user goal": lambda: (
@@ -364,7 +366,7 @@ def test_actual_delegated_child_sends_exact_persona_and_workspace_on_loopback(tm
                     replace_supplied in wire_system and wire_system.count("replace raw persona") == 1
                     and "Task-specific persona instructions (replacing identity):" in wire_system
                     and "selected profile persona" not in wire_system),
-                "default user goal": lambda: "You are Hermes Agent" in wire_system and task["context"] in wire_system,
+                "default user goal": lambda: "You are Hermes Agent" in wire_system and task["context"] not in wire_system,
                 "profile skill preload user goal": lambda: (
                     "FULL PROFILE SKILL BODY 5901" in wire_system and "PARENT SKILL MUST NOT LEAK" not in wire_system),
             }
@@ -383,7 +385,7 @@ def test_non_activating_skill_reader_returns_full_raw_body_without_setup(tmp_pat
     import json
     from tools import skills_tool
 
-    root = tmp_path / ".hermes"
+    root = tmp_path / "hermes-test-home"
     skill = root / "skills" / "research" / "raw-preload"
     (skill / "references").mkdir(parents=True)
     (skill / "references" / "guide.md").write_text("reference metadata only", encoding="utf-8")
@@ -516,7 +518,6 @@ def test_preload_preserves_canonical_errors_and_valid_siblings(tmp_path, monkeyp
 
 def test_registered_plugin_skill_reads_without_discovery_or_activation(tmp_path, monkeypatch):
     import json
-    from pathlib import Path
     from hermes_cli import plugins
     from tools import skills_tool
 
@@ -565,7 +566,6 @@ def test_registered_plugin_disabled_and_unreadable_reads_fail_closed(tmp_path, m
     from hermes_cli import plugins
     from tools import skills_tool
     import pytest
-    from pathlib import Path
 
     root = tmp_path / "profile"
     plugin_skill = root / "plugin-skill"
@@ -632,9 +632,7 @@ def test_preloaded_skill_init_failure_stops_before_first_model_call(tmp_path, mo
         (home / "skills" / "research" / "needed").mkdir(parents=True)
         (home / "skills" / "research" / "needed" / "SKILL.md").write_text(
             "---\nname: needed\n---\nrequired-body", encoding="utf-8")
-        import hermes_state
-        monkeypatch.setattr(hermes_state, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", ())
-        db = SessionDB(db_path=home / "state.db")
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
         option, error = TaskRouteOptions.parse({"goal": "must-not-infer", "skills": ["needed"]}, 0)
         assert error is None and option is not None
         policy = __import__("dataclasses").replace(
@@ -693,9 +691,7 @@ def test_explicit_empty_skill_preload_does_not_require_skill_tool(tmp_path, monk
         endpoint = f"http://127.0.0.1:{server.server_port}/v1"
         (home / "config.yaml").write_text(yaml.safe_dump({"model": {"provider": "custom",
             "default": "empty-skills-model", "base_url": endpoint}}), encoding="utf-8")
-        import hermes_state
-        monkeypatch.setattr(hermes_state, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", ())
-        db = SessionDB(db_path=home / "state.db")
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
         task = {"goal": "empty-skills-goal", "skills": []}
         option, error = TaskRouteOptions.parse(task, 0)
         assert error is None and option is not None
@@ -761,9 +757,7 @@ def test_actual_child_freezes_preloaded_body_across_prompt_rebuild_without_skill
         raw_body = "---\nname: frozen-guide\ndescription: frozen\n---\nEXACT ORIGINAL FROZEN BODY\n!`touch NO_SIDE_EFFECT`\n"
         skill_file = skill_dir / "SKILL.md"; skill_file.write_text(raw_body, encoding="utf-8")
         (skill_dir / "references" / "quick.md").write_text("reference bytes stay metadata", encoding="utf-8")
-        import hermes_state
-        monkeypatch.setattr(hermes_state, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", ())
-        db = SessionDB(db_path=home / "state.db")
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
         task = {"goal": "frozen-skill-goal", "skills": ["frozen-guide"]}
         option, error = TaskRouteOptions.parse(task, 0)
         assert error is None and option is not None

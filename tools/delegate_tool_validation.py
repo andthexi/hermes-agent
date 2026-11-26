@@ -205,14 +205,24 @@ def _workspace_for_parent(parent_agent: Any) -> str | None:
     return _resolve_workspace_hint(parent_agent)
 
 
+def _parent_profile_home(parent_agent: Any) -> Path:
+    """Read owner identity from typed persistence before any ambient selected-child scope."""
+    from hermes_constants import get_hermes_home
+
+    for owner in (getattr(parent_agent, "persistence", None), getattr(parent_agent, "_session_db", None)):
+        home = getattr(getattr(owner, "scope", None), "profile_dir", None)
+        if isinstance(home, (str, Path)):
+            return Path(home)
+    db_path = getattr(getattr(parent_agent, "_session_db", None), "db_path", None)
+    return Path(db_path).parent if isinstance(db_path, (str, Path)) else get_hermes_home()
+
+
 def _parent_tool_grant(parent_agent: Any, requested_names: tuple[str, ...] | list[str] = (),
                        *, include_bridges: bool = False) -> tuple[str, ...] | None:
     """Concrete tools visible to the owning parent before deferred tools are bridged."""
     if parent_agent is None:
         return None
-    from hermes_constants import get_hermes_home
-    session_db_path = getattr(getattr(parent_agent, "_session_db", None), "db_path", None)
-    owner_home = Path(session_db_path).parent if isinstance(session_db_path, (str, Path)) else get_hermes_home()
+    owner_home = _parent_profile_home(parent_agent)
     try:
         from tools.delegate_tool_routes import delegated_profile_scope
         import model_tools
@@ -443,10 +453,7 @@ def _validate_exact_profile_surface(index: int, option: TaskRouteOptions, route:
         from toolsets import session_disabled_toolsets
         import model_tools
         platform = str(getattr(parent_agent, "platform", None) or "cli")
-        parent_home = None
-        from hermes_constants import get_hermes_home
-        db_path = getattr(getattr(parent_agent, "_session_db", None), "db_path", None)
-        parent_home = Path(db_path).parent if isinstance(db_path, (str, Path)) else get_hermes_home()
+        parent_home = _parent_profile_home(parent_agent)
         parent_config = dict(profile_config)
         with delegated_profile_scope(parent_home):
             from hermes_cli.config import load_config_readonly

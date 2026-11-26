@@ -1,6 +1,7 @@
 """Regression tests for exact parent-surface permission boundaries."""
 
 import json
+from hermes_constants import get_hermes_home
 
 
 def test_public_exact_grant_cannot_admit_tool_appearing_after_parent_surface_freezes(tmp_path, monkeypatch):
@@ -26,7 +27,7 @@ def test_public_exact_grant_cannot_admit_tool_appearing_after_parent_surface_fre
     parent = None
     db = None
     try:
-        home = tmp_path / ".hermes"
+        home = tmp_path / "hermes-test-home"
         home.mkdir()
         (home / "config.yaml").write_text(yaml.safe_dump({
             "platform_toolsets": {"cli": ["web", "delegation"]},
@@ -36,7 +37,7 @@ def test_public_exact_grant_cannot_admit_tool_appearing_after_parent_surface_fre
         monkeypatch.setenv("HERMES_HOME", str(home))
 
         with FakeLLMServer(Text("fixture child completed")) as server:
-            db = SessionDB(db_path=tmp_path / "sessions.db")
+            db = SessionDB(db_path=get_hermes_home() / "state.db")
             parent = AIAgent(
                 api_key="fixture-key", base_url=server.base_url, provider="custom", api_mode="chat_completions",
                 model="fixture-model", enabled_toolsets=["web", "delegation"],
@@ -112,7 +113,7 @@ def test_unrestricted_parent_can_delegate_visible_plugin_with_search_off(tmp_pat
             handler=lambda *_args, **_kwargs: "unused", check_fn=lambda _name=name: _name == visible,
         )
     parents = []
-    db = SessionDB(db_path=home / "sessions.db")
+    db = SessionDB(db_path=get_hermes_home() / "state.db")
     try:
         with FakeLLMServer([Text("permitted plugin child completed")]) as server:
             for selection in (None, []):
@@ -153,3 +154,42 @@ def test_unrestricted_parent_can_delegate_visible_plugin_with_search_off(tmp_pat
             if current is not None:
                 registry.restore_registration(name, current, prior)
         invalidate_check_fn_cache()
+
+
+def test_typed_parent_store_pins_permission_home_across_foreign_profile_scope(tmp_path, monkeypatch):
+    """The removed db_path attribute must not redirect parent policy to a selected child's config."""
+    import hermes_yaml as yaml
+    from persistence_assembly import open_persistence, profile_scope
+    from run_agent import AIAgent
+    from tools.delegate_tool_routes import delegated_profile_scope
+    from tools.delegate_tool_validation import _parent_profile_home, _parent_tool_grant
+
+    home, foreign = tmp_path / "owner", tmp_path / "foreign"
+    home.mkdir()
+    foreign.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(yaml.safe_dump({
+        "platform_toolsets": {"cli": ["file", "delegation"]},
+        "tools": {"tool_search": {"enabled": "off", "defer": []}},
+    }), encoding="utf-8")
+    (foreign / "config.yaml").write_text(yaml.safe_dump({
+        "platform_toolsets": {"cli": ["terminal"]},
+        "agent": {"disabled_toolsets": ["file"]},
+        "tools": {"tool_search": {"enabled": "off", "defer": []}},
+    }), encoding="utf-8")
+    store = open_persistence(profile_scope(home=home), eager=True)
+    parent = None
+    try:
+        parent = AIAgent(provider="custom", model="fixture-model", base_url="http://127.0.0.1:9/v1",
+                         api_key="fixture-key", persistence=store, enabled_toolsets=["file", "delegation"],
+                         platform="cli", quiet_mode=True, skip_context_files=True, skip_memory=True)
+        assert "read_file" in parent.valid_tool_names
+        with delegated_profile_scope(foreign):
+            assert _parent_profile_home(parent) == home
+            grant = _parent_tool_grant(parent)
+        assert grant is not None and "read_file" in grant and "terminal" not in grant
+    finally:
+        if parent is not None:
+            parent.close()
+        store.close()

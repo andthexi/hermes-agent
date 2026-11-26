@@ -1,6 +1,7 @@
 """S1 route/profile/provider behaviors at real option and route boundaries."""
 
 import json
+from hermes_constants import get_hermes_home
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,7 +26,7 @@ class Parent:
 def test_real_profile_config_scope_selects_provider_and_alias_credentials(tmp_path, monkeypatch):
     from tools.delegate_tool_validation import resolve_task_options, resolve_task_routes
 
-    root = tmp_path / "os" / ".hermes"
+    root = tmp_path / "os" / "hermes-test-home"
     root.mkdir(parents=True)
     (root / "config.yaml").write_text(yaml.safe_dump({
         "model": {"provider": "custom", "default": "parent-model", "base_url": "http://127.0.0.1:9710/v1"},
@@ -97,7 +98,7 @@ def test_runtime_profile_scope_selects_real_alias_credentials_and_resets_scope(t
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        root = tmp_path / "os" / ".hermes"
+        root = tmp_path / "os" / "hermes-test-home"
         root.mkdir(parents=True)
         monkeypatch.setenv("HOME", str(tmp_path / "os"))
         monkeypatch.setenv("HERMES_HOME", str(root))
@@ -150,7 +151,7 @@ def test_dispatch_reports_unverified_model_pair_and_runs_exact_route(tmp_path, m
     from tools.delegate_tool import _routes_for
     from tools.delegate_tool_validation import _catalog_verdict
 
-    root = tmp_path / "os" / ".hermes"
+    root = tmp_path / "os" / "hermes-test-home"
     root.mkdir(parents=True)
     endpoint = "http://127.0.0.1:9721/v1"
     (root / "config.yaml").write_text(yaml.safe_dump({
@@ -182,7 +183,7 @@ def test_dispatch_reports_unverified_model_pair_and_runs_exact_route(tmp_path, m
 def test_dispatch_preserves_unverified_reasoning_none_in_route_and_policy(tmp_path, monkeypatch):
     from tools.delegate_tool import _routes_for
 
-    root = tmp_path / "os" / ".hermes"
+    root = tmp_path / "os" / "hermes-test-home"
     root.mkdir(parents=True)
     endpoint = "http://127.0.0.1:9722/v1"
     (root / "config.yaml").write_text(yaml.safe_dump({
@@ -219,7 +220,7 @@ def test_dispatch_preserves_unverified_reasoning_none_in_route_and_policy(tmp_pa
 def test_profile_only_pin_carries_requested_and_resolved_route_report(tmp_path, monkeypatch):
     from tools.delegate_tool_routes import TaskRoute
 
-    root = tmp_path / "os" / ".hermes"
+    root = tmp_path / "os" / "hermes-test-home"
     root.mkdir(parents=True)
     coder = root / "profiles" / "coder"
     coder.mkdir(parents=True)
@@ -357,13 +358,11 @@ def test_delegate_task_runs_real_profile_child_on_loopback_and_reports_exact_pin
         from tools.delegate_tool import delegate_task as real_delegate_task
         monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: name == "coder")
         monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda name: coder)
-        monkeypatch.setattr("tools.delegate_tool._load_config", lambda: launch_config["delegation"])
+        monkeypatch.setattr("tools.delegate_tool_config._load_config", lambda: launch_config["delegation"])
         import tools.delegate_tool_config as delegation_config
         monkeypatch.setattr(delegation_config, "_load_config", lambda: launch_config["delegation"])
         monkeypatch.setattr("tools.delegate_tool._create_isolated_worktree", lambda *a, **k: None, raising=False)
-        import hermes_state
-        monkeypatch.setattr(hermes_state, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", ())
-        db = SessionDB(db_path=tmp_path / "sessions.db")
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
         parent = AIAgent(api_key="launch-parent-key", base_url=endpoint, provider="custom", api_mode="chat_completions",
                          model="launch-switched-model", platform="cli", quiet_mode=True,
                          skip_context_files=True, skip_memory=True, save_trajectories=False,
@@ -540,7 +539,7 @@ def test_delegate_task_provider_only_uses_profile_saved_alias_in_real_child(tmp_
     db = None
     try:
         host_home = tmp_path / "os"
-        root = host_home / ".hermes"
+        root = host_home / "hermes-test-home"
         coder = root / "profiles" / "coder"
         coder.mkdir(parents=True)
         endpoint = f"http://127.0.0.1:{server.server_port}/v1"
@@ -558,11 +557,11 @@ def test_delegate_task_provider_only_uses_profile_saved_alias_in_real_child(tmp_
         monkeypatch.setenv("HERMES_HOME", str(root))
         monkeypatch.delenv("MISSING_OLD_ALIAS_KEY", raising=False)
         monkeypatch.delenv("TARGET_RELAY_KEY", raising=False)
-        monkeypatch.setattr("tools.delegate_tool._load_config", lambda: {"max_iterations": 2, "fallback_providers": []})
+        monkeypatch.setattr("tools.delegate_tool_config._load_config", lambda: {"max_iterations": 2, "fallback_providers": []})
         import tools.delegate_tool_config as delegation_config
         monkeypatch.setattr(delegation_config, "_load_config", lambda: {"max_iterations": 2, "fallback_providers": []})
 
-        db = SessionDB(db_path=tmp_path / "sessions.db")
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
         parent = AIAgent(api_key="launch-parent-key", base_url=endpoint, provider="custom", api_mode="chat_completions",
                          model="launch-switched-model", platform="cli", quiet_mode=True,
                          skip_context_files=True, skip_memory=True, save_trajectories=False,
@@ -650,7 +649,7 @@ def test_delegate_task_explicit_model_provider_uses_profile_credentials_in_real_
     db = None
     try:
         host_home = tmp_path / "os"
-        root = host_home / ".hermes"
+        root = host_home / "hermes-test-home"
         coder = root / "profiles" / "coder"
         empty = root / "profiles" / "empty"
         coder.mkdir(parents=True)
@@ -699,11 +698,11 @@ def test_delegate_task_explicit_model_provider_uses_profile_credentials_in_real_
 
         monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", observe_provider_resolution)
         monkeypatch.setattr("model_tools._active_model_config", lambda: (None, {}))
-        monkeypatch.setattr("tools.delegate_tool._load_config", lambda: {"max_iterations": 2, "fallback_providers": []})
+        monkeypatch.setattr("tools.delegate_tool_config._load_config", lambda: {"max_iterations": 2, "fallback_providers": []})
         import tools.delegate_tool_config as delegation_config
         monkeypatch.setattr(delegation_config, "_load_config", lambda: {"max_iterations": 2, "fallback_providers": []})
 
-        db = SessionDB(db_path=tmp_path / "sessions.db")
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
         parent = AIAgent(api_key="launch-parent-key", base_url=endpoint, provider="custom", api_mode="chat_completions",
                          model="launch-switched-model", platform="cli", quiet_mode=True,
                          skip_context_files=True, skip_memory=True, save_trajectories=False,
@@ -821,7 +820,7 @@ def test_delegate_task_model_only_keeps_selected_profile_baseline_provider(tmp_p
     db = None
     try:
         host_home = tmp_path / "os"
-        root = host_home / ".hermes"
+        root = host_home / "hermes-test-home"
         coder = root / "profiles" / "coder"
         coder.mkdir(parents=True)
         endpoint = f"http://127.0.0.1:{server.server_port}/v1"
@@ -836,11 +835,11 @@ def test_delegate_task_model_only_keeps_selected_profile_baseline_provider(tmp_p
         monkeypatch.setenv("HOME", str(host_home))
         monkeypatch.setenv("HERMES_HOME", str(root))
         monkeypatch.delenv("STEADY_PROFILE_KEY", raising=False)
-        monkeypatch.setattr("tools.delegate_tool._load_config", lambda: {"max_iterations": 2, "fallback_providers": []})
+        monkeypatch.setattr("tools.delegate_tool_config._load_config", lambda: {"max_iterations": 2, "fallback_providers": []})
         import tools.delegate_tool_config as delegation_config
         monkeypatch.setattr(delegation_config, "_load_config", lambda: {"max_iterations": 2, "fallback_providers": []})
 
-        db = SessionDB(db_path=tmp_path / "sessions.db")
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
         parent = AIAgent(api_key="launch-parent-key", base_url=endpoint, provider="custom", api_mode="chat_completions",
                          model="launch-switched-model", platform="cli", quiet_mode=True,
                          skip_context_files=True, skip_memory=True, save_trajectories=False,
@@ -905,11 +904,10 @@ def _schema_parent():
 
 
 def _temporary_schema_backend(tmp_path, monkeypatch, *, name, plugin_source):
-    from pathlib import Path
     from hermes_cli import plugins as plugins_mod
     from hermes_cli.plugins import PluginManager
 
-    home = tmp_path / ".hermes"
+    home = tmp_path / "hermes-test-home"
     plugin_dir = home / "plugins" / name
     plugin_dir.mkdir(parents=True)
     (plugin_dir / "plugin.yaml").write_text(yaml.safe_dump({"name": name, "version": "1.0"}), encoding="utf-8")
@@ -1098,14 +1096,14 @@ def test_public_unknown_task_keys_are_refused_on_internal_credentials_route(tmp_
     from tools.delegate_tool import delegate_task
 
     with FakeLLMServer([Text("child finished")], api_key="internal-loopback-key") as server:
-        home = tmp_path / ".hermes"
+        home = tmp_path / "hermes-test-home"
         write_hermes_home(
             home, server.base_url, api_key="internal-loopback-key",
             extra_config="delegation:\n  fallback_providers: []\n  worktree_isolation: false\n",
         )
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("HERMES_HOME", str(home))
-        db = SessionDB(db_path=tmp_path / "sessions.db")
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
         parent = AIAgent(
             api_key="internal-loopback-key", base_url=server.base_url, provider="custom",
             api_mode="chat_completions", model="fake-model", platform="cli", quiet_mode=True,
@@ -1136,14 +1134,14 @@ def test_public_delegate_refuses_null_and_value_unknown_keys_default_and_interna
     from tools.delegate_tool import delegate_task
 
     with FakeLLMServer([Text("child finished")], api_key="parent-loopback-key") as server:
-        home = tmp_path / ".hermes"
+        home = tmp_path / "hermes-test-home"
         write_hermes_home(
             home, server.base_url, api_key="parent-loopback-key",
             extra_config="delegation:\n  fallback_providers: []\n  worktree_isolation: false\n",
         )
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("HERMES_HOME", str(home))
-        db = SessionDB(db_path=tmp_path / "sessions.db")
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
         parent = AIAgent(
             api_key="parent-loopback-key", base_url=server.base_url, provider="custom",
             api_mode="chat_completions", model="fake-model", platform="cli", quiet_mode=True,
@@ -1190,14 +1188,14 @@ def test_raw_route_fields_are_refused_before_default_and_internal_child_inferenc
     sentinels = {name: f"SYNTHETIC-RAW-{name}-NEVER-LOG" for name in raw_fields}
     with FakeLLMServer(lambda _request: Text("valid sibling completed"),
                        api_key=["parent-loopback-key", "internal-loopback-key"]) as server:
-        home = tmp_path / ".hermes"
+        home = tmp_path / "hermes-test-home"
         write_hermes_home(
             home, server.base_url, api_key="parent-loopback-key",
             extra_config="delegation:\n  fallback_providers: []\n  worktree_isolation: false\n",
         )
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("HERMES_HOME", str(home))
-        db = SessionDB(db_path=tmp_path / "sessions.db")
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
         parent = AIAgent(
             api_key="parent-loopback-key", base_url=server.base_url, provider="custom",
             api_mode="chat_completions", model="fake-model", platform="cli", quiet_mode=True,
